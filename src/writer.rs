@@ -497,8 +497,8 @@ impl Writer {
                     XrefEntry::Compressed { container: _, index: _ } => {
                         xref_section.add_unusable_free_entry();
                     }
-                    XrefEntry::Free => {
-                        xref_section.add_entry(XrefEntry::Free);
+                    XrefEntry::Free { next_free, generation } => {
+                        xref_section.add_entry(XrefEntry::Free { next_free, generation });
                     }
                     XrefEntry::UnusableFree => {
                         xref_section.add_unusable_free_entry();
@@ -558,11 +558,11 @@ impl Writer {
             // Add entries to stream
             for (obj_id, entry) in (section.starting_id..).zip(section.entries) {
                 match entry {
-                    XrefEntry::Free => {
+                    XrefEntry::Free { next_free, generation } => {
                         // Type 0
                         xref_stream.push(0);
-                        xref_stream.extend(obj_id.to_be_bytes());
-                        xref_stream.extend(vec![0, 0]); // TODO add generation number
+                        xref_stream.extend(next_free.to_be_bytes());
+                        xref_stream.extend(generation.to_be_bytes());
                     }
                     XrefEntry::UnusableFree => {
                         // Type 0

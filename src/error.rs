@@ -97,6 +97,17 @@ pub enum Error {
     /// Error while parsing cross reference table.
     #[error("failed parsing cross reference table")]
     Xref(#[from] XrefError),
+    /// Physical object scanning cannot recover authoritative revision state.
+    /// The original resolution failure is retained as the error source.
+    ///
+    /// Lenient loading can correct local pointers to actual xref sections, but
+    /// does not synthesize entries from object headers, even for an apparently
+    /// single-revision file. Both full and metadata loaders use this policy.
+    #[error("cross-reference reconstruction would lose revision authority")]
+    ReconstructionAuthority {
+        #[source]
+        source: Box<Error>,
+    },
     /// Invalid indirect object while parsing at offset.
     #[error("invalid indirect object at byte offset {offset}")]
     IndirectObject { offset: usize },
@@ -161,6 +172,9 @@ pub enum XrefError {
     /// Could not find start of cross reference table.
     #[error("invalid start value")]
     Start,
+    /// Final startxref recovery could select an incomplete revision chain.
+    #[error("ambiguous final startxref recovery")]
+    AmbiguousStart,
     /// The trailer's "Prev" field was invalid.
     #[error("invalid start value in Prev field")]
     PrevStart,

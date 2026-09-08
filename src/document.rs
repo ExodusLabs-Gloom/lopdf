@@ -475,7 +475,7 @@ impl Document {
         // Add the objects from the object streams now that they have been decrypted.
         let mut object_streams = vec![];
 
-        for object in self.objects.values() {
+        for (&container_id, object) in &self.objects {
             let Ok(stream) = object.as_stream() else {
                 continue;
             };
@@ -484,13 +484,19 @@ impl Document {
                 continue;
             }
 
-            let Some(obj_stream) = ObjectStream::new(stream).ok() else {
+            let Some(obj_stream) = ObjectStream::parse_indexed_with_limit(stream, None).ok() else {
                 continue;
             };
 
-            // TODO: Is insert and replace intended behavior?
-            // See https://github.com/J-F-Liu/lopdf/issues/160 for more info
-            object_streams.extend(obj_stream.objects);
+            object_streams.extend(
+                obj_stream
+                    .into_iter()
+                    .filter(|(index, ((id, _), _))| {
+                        self.reference_table
+                            .allows_compressed_object(*id, container_id.0, *index)
+                    })
+                    .map(|(_, member)| member),
+            );
         }
 
         // Only add entries, but never replace entries

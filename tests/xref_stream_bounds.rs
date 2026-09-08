@@ -111,7 +111,7 @@ fn incremental_classic_xref_pdf(objects: usize) -> Vec<u8> {
 fn zero_width_xref_stream_is_rejected() {
     let pdf = xref_stream_pdf([0, 0, 0], 1_000_000, b"");
     match Document::load_mem(&pdf) {
-        Err(Error::Parse(ParseError::InvalidXref)) => {}
+        Err(Error::ReconstructionAuthority { source }) if matches!(*source, Error::Parse(ParseError::InvalidXref)) => {}
         Err(other) => panic!("expected InvalidXref, got {other:?}"),
         Ok(doc) => panic!(
             "a 137-byte file claiming 1,000,000 xref entries loaded with {} entries",
@@ -128,7 +128,7 @@ fn zero_width_xref_stream_is_rejected() {
 fn index_count_past_stream_length_is_rejected() {
     let pdf = xref_stream_pdf([1, 1, 1], 1_000_000, &[1, 0, 0]);
     match Document::load_mem(&pdf) {
-        Err(Error::Parse(ParseError::InvalidXref)) => {}
+        Err(Error::ReconstructionAuthority { source }) if matches!(*source, Error::Parse(ParseError::InvalidXref)) => {}
         Err(other) => panic!("expected InvalidXref, got {other:?}"),
         Ok(_) => panic!("an /Index count far past the stream length was accepted"),
     }
@@ -139,7 +139,7 @@ fn negative_index_count_is_rejected() {
     let pdf = xref_stream_pdf([1, 1, 1], -1, &[]);
     assert!(matches!(
         Document::load_mem(&pdf),
-        Err(Error::Parse(ParseError::InvalidXref))
+        Err(Error::ReconstructionAuthority { source }) if matches!(*source, Error::Parse(ParseError::InvalidXref))
     ));
 }
 
@@ -162,7 +162,7 @@ fn total_index_count_past_stream_length_is_rejected() {
     let pdf = xref_stream_pdf_with_index([1, 4, 2], "0 1 2 1", &body);
     assert!(matches!(
         Document::load_mem(&pdf),
-        Err(Error::Parse(ParseError::InvalidXref))
+        Err(Error::ReconstructionAuthority { source }) if matches!(*source, Error::Parse(ParseError::InvalidXref))
     ));
 }
 
@@ -173,7 +173,9 @@ fn total_index_count_past_stream_length_is_rejected() {
 fn degenerate_narrow_xref_records_are_rejected() {
     let pdf = xref_stream_pdf([0, 1, 0], 4, &[0; 4]);
     let result = Document::load_mem(&pdf);
-    assert!(matches!(result, Err(Error::Parse(ParseError::InvalidXref))));
+    assert!(
+        matches!(result, Err(Error::ReconstructionAuthority { source }) if matches!(*source, Error::Parse(ParseError::InvalidXref)))
+    );
 }
 
 #[test]

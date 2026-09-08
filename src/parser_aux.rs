@@ -616,27 +616,32 @@ pub fn decode_xref_stream_with_limit(
                 } else {
                     1
                 };
+                // Consume a whole record even for an unknown entry type. Decode
+                // before narrowing so high bytes cannot alias a valid identity.
+                let field2 = read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
+                let field3 = read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
+                // Match classic-table handling: consume invalid IDs without granting authority.
+                let Some(object_number) = start.checked_add(j).and_then(|id| u32::try_from(id).ok()) else {
+                    continue;
+                };
                 match entry_type {
                     0 => {
-                        // free object
-                        read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
+                        // Free entries shadow older live objects just like normal entries.
+                        let next_free = u32::try_from(field2).map_err(|_| ParseError::InvalidXref)?;
+                        let generation = u16::try_from(field3).map_err(|_| ParseError::InvalidXref)?;
+                        xref.insert(object_number, XrefEntry::Free { next_free, generation });
                     }
                     1 => {
                         // normal object
-                        let offset = read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        let generation = if !bytes3.is_empty() {
-                            read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?
-                        } else {
-                            0
-                        } as u16;
-                        xref.insert((start + j) as u32, XrefEntry::Normal { offset, generation });
+                        let offset = u32::try_from(field2).map_err(|_| ParseError::InvalidXref)?;
+                        let generation = u16::try_from(field3).map_err(|_| ParseError::InvalidXref)?;
+                        xref.insert(object_number, XrefEntry::Normal { offset, generation });
                     }
                     2 => {
                         // compressed object
-                        let container = read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        let index = read_big_endian_integer(&mut reader, bytes3.as_mut_slice())? as u16;
-                        xref.insert((start + j) as u32, XrefEntry::Compressed { container, index });
+                        let container = u32::try_from(field2).map_err(|_| ParseError::InvalidXref)?;
+                        let index = u16::try_from(field3).map_err(|_| ParseError::InvalidXref)?;
+                        xref.insert(object_number, XrefEntry::Compressed { container, index });
                     }
                     _ => {}
                 }
@@ -649,13 +654,15 @@ pub fn decode_xref_stream_with_limit(
     Ok((xref, dict))
 }
 
-fn read_big_endian_integer(reader: &mut Cursor<Vec<u8>>, buffer: &mut [u8]) -> Result<u32> {
+// /W fields are bounded to eight bytes above; an omitted field decodes as zero.
+fn read_big_endian_integer(reader: &mut Cursor<Vec<u8>>, buffer: &mut [u8]) -> Result<u64> {
     reader.read_exact(buffer)?;
-    let mut value = 0;
-    for &mut byte in buffer {
-        value = (value << 8) + u32::from(byte);
-    }
-    Ok(value)
+    buffer.iter().try_fold(0u64, |value, &byte| {
+        value
+            .checked_mul(256)
+            .and_then(|v| v.checked_add(u64::from(byte)))
+            .ok_or_else(|| ParseError::InvalidXref.into())
+    })
 }
 
 fn parse_integer_array(array: &Object) -> Result<Vec<i64>> {

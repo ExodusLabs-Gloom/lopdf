@@ -25,10 +25,21 @@ pub enum XrefType {
 
 #[derive(Debug, Clone)]
 pub enum XrefEntry {
-    Free, // TODO add generation number
+    /// A free-list entry, including the next free object and reuse generation.
+    Free {
+        next_free: u32,
+        generation: u16,
+    },
+    /// Writer shorthand for a free entry that cannot be reused (generation 65535).
     UnusableFree,
-    Normal { offset: u32, generation: u16 },
-    Compressed { container: u32, index: u16 },
+    Normal {
+        offset: u32,
+        generation: u16,
+    },
+    Compressed {
+        container: u32,
+        index: u16,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +74,18 @@ impl Xref {
         }
     }
 
+    /// Preserve lenient handling of unlisted objects, but never materialize a
+    /// stale stream copy over an effective free, normal, or different-member entry.
+    pub(crate) fn allows_compressed_object(&self, id: u32, container_id: u32, member_index: usize) -> bool {
+        match self.get(id) {
+            None => true,
+            Some(XrefEntry::Compressed { container, index }) => {
+                *container == container_id && usize::from(*index) == member_index
+            }
+            Some(_) => false,
+        }
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear()
     }
@@ -89,11 +112,18 @@ impl XrefEntry {
         let mut result = Vec::new();
 
         match self {
-            XrefEntry::Free | XrefEntry::UnusableFree => {
+            XrefEntry::Free { next_free, generation } => {
                 // Type 0: Free object
                 encode_field(0, widths[0], &mut result);
-                encode_field(0, widths[1], &mut result); // Next free object
-                encode_field(0, widths[2], &mut result); // Generation
+                encode_field(*next_free as u64, widths[1], &mut result);
+                encode_field(*generation as u64, widths[2], &mut result);
+            }
+            XrefEntry::UnusableFree => {
+                return XrefEntry::Free {
+                    next_free: 0,
+                    generation: u16::MAX,
+                }
+                .encode_for_xref_stream(widths);
             }
             XrefEntry::Normal { offset, generation } => {
                 // Type 1: Uncompressed object
@@ -121,8 +151,8 @@ impl XrefEntry {
             XrefEntry::Compressed { container: _, index: _ } => {
                 writeln!(file, "{:>010} {:>05} f ", 0, 65535)?;
             }
-            XrefEntry::Free => {
-                writeln!(file, "{:>010} {:>05} f ", 0, 0)?;
+            XrefEntry::Free { next_free, generation } => {
+                writeln!(file, "{next_free:>010} {generation:>05} f ")?;
             }
             XrefEntry::UnusableFree => {
                 writeln!(file, "{:>010} {:>05} f ", 0, 65535)?;
@@ -216,7 +246,11 @@ impl<'a> XrefStreamBuilder<'a> {
                     max_container = max_container.max(*container);
                     max_index = max_index.max(*index);
                 }
-                _ => {}
+                XrefEntry::Free { next_free, generation } => {
+                    max_offset = max_offset.max(*next_free as u64);
+                    max_gen = max_gen.max(*generation);
+                }
+                XrefEntry::UnusableFree => max_gen = u16::MAX,
             }
         }
 
