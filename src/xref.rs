@@ -74,15 +74,13 @@ impl Xref {
         }
     }
 
-    /// Preserve lenient handling of unlisted objects, but never materialize a
-    /// stale stream copy over an effective free, normal, or different-member entry.
+    /// Materialize only members explicitly identified by the effective xref.
     pub(crate) fn allows_compressed_object(&self, id: u32, container_id: u32, member_index: usize) -> bool {
         match self.get(id) {
-            None => true,
             Some(XrefEntry::Compressed { container, index }) => {
                 *container == container_id && usize::from(*index) == member_index
             }
-            Some(_) => false,
+            _ => false,
         }
     }
 
