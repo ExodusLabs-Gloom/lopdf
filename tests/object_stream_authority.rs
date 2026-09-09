@@ -13,6 +13,7 @@ fn fixture(entry: Option<XrefEntry>, duplicate: bool) -> Vec<u8> {
     }
     match entry {
         None => {}
+        Some(XrefEntry::Null) => records.push((5, 255, u32::MAX, u16::MAX)),
         Some(XrefEntry::Compressed { container, index }) => records.push((5, 2, container, index)),
         Some(XrefEntry::Free { next_free, generation }) => records.push((5, 0, next_free, generation)),
         Some(XrefEntry::Normal { generation, .. }) => {
@@ -42,6 +43,7 @@ fn fixture(entry: Option<XrefEntry>, duplicate: bool) -> Vec<u8> {
 fn cases() -> Vec<(Option<XrefEntry>, Option<&'static str>)> {
     vec![
         (None, None),
+        (Some(XrefEntry::Null), None),
         (Some(XrefEntry::Compressed { container: 8, index: 0 }), Some("copy 8")),
         (
             Some(XrefEntry::Free {

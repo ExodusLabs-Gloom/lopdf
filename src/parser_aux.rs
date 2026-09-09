@@ -626,7 +626,9 @@ pub fn decode_xref_stream_with_limit(
                         let index = u16::try_from(field3).map_err(|_| ParseError::InvalidXref)?;
                         xref.insert(object_number, XrefEntry::Compressed { container, index });
                     }
-                    _ => {}
+                    _ => {
+                        xref.insert(object_number, XrefEntry::Null);
+                    }
                 }
             }
         }

@@ -841,8 +841,8 @@ impl Reader<'_> {
                     // Store compressed object info for later processing
                     object_streams.push((obj_num, container, index));
                 }
-                XrefEntry::Free { .. } | XrefEntry::UnusableFree => {
-                    // Skip free entries
+                XrefEntry::Free { .. } | XrefEntry::UnusableFree | XrefEntry::Null => {
+                    // Free entries and null authority do not materialize objects.
                 }
             }
         }

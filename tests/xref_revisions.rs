@@ -1007,8 +1007,19 @@ fn wide_xref_fields_preserve_representable_limits() {
 
 #[test]
 fn wide_unknown_xref_type_does_not_alias_normal_or_shift_next_record() {
-    let (xref, _) = decode_xref_stream(wide_xref_records(&[[0x1_0000_0001, 1, 0], [1, 42, 7]])).unwrap();
-    assert!(xref.get(5).is_none());
+    let (xref, _) = decode_xref_stream(wide_xref_records(&[
+        [0x1_0000_0001, u64::MAX, u64::MAX],
+        [1, 42, 7],
+        [255, u64::MAX, u64::MAX],
+        [2, 8, 9],
+    ]))
+    .unwrap();
+    assert!(matches!(xref.get(5), Some(XrefEntry::Null)));
+    assert!(matches!(xref.get(7), Some(XrefEntry::Null)));
+    assert!(matches!(
+        xref.get(8),
+        Some(XrefEntry::Compressed { container: 8, index: 9 })
+    ));
     assert!(matches!(
         xref.get(6),
         Some(XrefEntry::Normal {
@@ -1105,6 +1116,35 @@ fn object_stream_index_controls_full_and_metadata_identity() {
             );
             let metadata = Document::load_metadata_mem_with_password(&bytes, password.unwrap_or("")).unwrap();
             assert_eq!(metadata.title.as_deref(), title);
+        }
+    }
+}
+
+#[test]
+fn encrypted_unknown_authority_blocks_physical_object_stream_members() {
+    for password in ["", "user"] {
+        for unknown in [3, 255] {
+            let mut bytes = indexed_object_stream_fixture(5, 0, Some(password));
+            let control = Document::load_mem_with_options(&bytes, lopdf::LoadOptions::with_password(password)).unwrap();
+            assert!(control.get_object((5, 0)).is_ok());
+            let marker = b"/Index [5 1] /Length 7 >>\nstream\n";
+            let start = bytes.windows(marker.len()).rposition(|w| w == marker).unwrap() + marker.len();
+            bytes[start..start + 7].copy_from_slice(&[unknown, 255, 255, 255, 255, 255, 255]);
+            for strict in [false, true] {
+                let mut options = lopdf::LoadOptions::with_password(password);
+                options.strict = strict;
+                let doc = Document::load_mem_with_options(&bytes, options).unwrap();
+                assert!(matches!(doc.reference_table.get(5), Some(XrefEntry::Null)));
+                assert!(doc.get_object((5, 0)).is_err());
+                assert!(!doc.objects.contains_key(&(5, 0)));
+                assert!(doc.get_object((8, 0)).is_ok());
+            }
+            assert_eq!(
+                Document::load_metadata_mem_with_password(&bytes, password)
+                    .unwrap()
+                    .title,
+                None
+            );
         }
     }
 }

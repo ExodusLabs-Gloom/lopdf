@@ -306,7 +306,7 @@ impl Document {
             }
             let generation = match self.reference_table.get(id) {
                 Some(XrefEntry::Free { generation, .. }) => *generation,
-                Some(XrefEntry::UnusableFree) => u16::MAX,
+                Some(XrefEntry::UnusableFree | XrefEntry::Null) => u16::MAX,
                 Some(XrefEntry::Normal { generation, .. }) => generation.saturating_add(1),
                 Some(XrefEntry::Compressed { .. }) => 1,
                 None => 0,
@@ -587,6 +587,9 @@ impl Writer {
     /// [`std::io::ErrorKind::Unsupported`] before a single byte is written; turning
     /// such an entry into a free one would present a live object as deleted.
     fn write_xref(file: &mut dyn Write, xref: &Xref) -> Result<()> {
+        if xref.entries.values().any(|entry| matches!(entry, XrefEntry::Null)) {
+            return Err(crate::xref::null_serialization_error());
+        }
         if xref
             .entries
             .values()
@@ -620,6 +623,7 @@ impl Writer {
                     xref_section = XrefSection::new(obj_id);
                 }
                 match *entry {
+                    XrefEntry::Null => return Err(crate::xref::null_serialization_error()),
                     XrefEntry::Normal { offset, generation } => {
                         // Add entry
                         xref_section.add_entry(XrefEntry::Normal { offset, generation });
@@ -657,6 +661,9 @@ impl Writer {
 
     /// Create stream for Cross reference stream.
     fn create_xref_steam(xref: &Xref, filter: XRefStreamFilter) -> Result<(Vec<u8>, usize, Object)> {
+        if xref.entries.values().any(|entry| matches!(entry, XrefEntry::Null)) {
+            return Err(crate::xref::null_serialization_error());
+        }
         let mut xref_sections = Vec::new();
         let mut xref_section = XrefSection::new(0);
         if let Some(entry @ XrefEntry::Free { .. }) = xref.get(0) {
@@ -697,6 +704,7 @@ impl Writer {
             // Add entries to stream
             for (obj_id, entry) in (section.starting_id..).zip(section.entries) {
                 match entry {
+                    XrefEntry::Null => return Err(crate::xref::null_serialization_error()),
                     XrefEntry::Free { next_free, generation } => {
                         // Type 0
                         xref_stream.push(0);
@@ -970,6 +978,33 @@ fn save_document() {
     assert!(file_path.is_file());
     // Check if the file is above 400 bytes (should be about 610 bytes)
     assert!(file_path.metadata().unwrap().len() > 400);
+}
+
+#[test]
+fn raw_null_authority_is_rejected_by_both_writers() {
+    for id in [0, 2] {
+        let mut xref = Xref::new(3, XrefType::CrossReferenceStream);
+        xref.insert(
+            1,
+            XrefEntry::Normal {
+                offset: 9,
+                generation: 0,
+            },
+        );
+        xref.insert(id, XrefEntry::Null);
+        let mut bytes = Vec::new();
+        assert_eq!(
+            Writer::write_xref(&mut bytes, &xref).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(bytes.is_empty());
+        assert_eq!(
+            Writer::create_xref_steam(&xref, XRefStreamFilter::None)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
 }
 
 #[test]

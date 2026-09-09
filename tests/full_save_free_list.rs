@@ -133,7 +133,10 @@ fn verify(bytes: &[u8], doc: &Document, encoding: Encoding, expected_free: &[(u3
             assert!(header.contains(&format!("/Index[0 {}]", max + 1)));
             for id in 0..=max {
                 let record = &tail[begin + id as usize * 7..begin + (id as usize + 1) * 7];
-                assert_eq!(record, xref.get(id).unwrap().encode_for_xref_stream(&[1, 4, 2]));
+                assert_eq!(
+                    record,
+                    xref.get(id).unwrap().encode_for_xref_stream(&[1, 4, 2]).unwrap()
+                );
             }
             assert_eq!(tail[begin], 0, "object 0 must have a type-0 record");
         }

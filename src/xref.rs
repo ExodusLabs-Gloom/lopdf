@@ -27,6 +27,8 @@ pub enum XrefType {
 
 #[derive(Debug, Clone)]
 pub enum XrefEntry {
+    /// Cross-reference-stream authority interpreted as a reference to the null object.
+    Null,
     /// A free-list entry, including the next free object and reuse generation.
     Free {
         next_free: u32,
@@ -107,11 +109,12 @@ impl XrefEntry {
         matches!(*self, XrefEntry::Compressed { .. })
     }
 
-    /// Encode entry for use in cross-reference stream
-    pub fn encode_for_xref_stream(&self, widths: &[usize; 3]) -> Vec<u8> {
+    /// Encode an entry for a cross-reference stream, rejecting input-only null authority.
+    pub fn encode_for_xref_stream(&self, widths: &[usize; 3]) -> Result<Vec<u8>> {
         let mut result = Vec::new();
 
         match self {
+            XrefEntry::Null => return Err(null_serialization_error()),
             XrefEntry::Free { next_free, generation } => {
                 // Type 0: Free object
                 encode_field(0, widths[0], &mut result);
@@ -139,7 +142,7 @@ impl XrefEntry {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Write Entry in Cross Reference Table.
@@ -150,6 +153,7 @@ impl XrefEntry {
     /// refused with [`std::io::ErrorKind::Unsupported`] instead.
     pub fn write_xref_entry(&self, file: &mut dyn Write) -> Result<()> {
         match self {
+            XrefEntry::Null => return Err(null_serialization_error()),
             XrefEntry::Normal { offset, generation } => {
                 writeln!(file, "{offset:>010} {generation:>05} n ")?;
             }
@@ -192,7 +196,7 @@ impl XrefSection {
 
     /// Write Section in Cross Reference Table.
     ///
-    /// Refuses a section holding compressed entries with
+    /// Refuses a section holding compressed entries or null authority with
     /// [`std::io::ErrorKind::Unsupported`] before the section header is written:
     /// a classic table cannot locate objects inside object streams.
     pub fn write_xref_section(&self, file: &mut dyn Write) -> Result<()> {
@@ -200,11 +204,11 @@ impl XrefSection {
             if self
                 .entries
                 .iter()
-                .any(|entry| matches!(entry, XrefEntry::Compressed { .. }))
+                .any(|entry| matches!(entry, XrefEntry::Compressed { .. } | XrefEntry::Null))
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "a compressed cross-reference entry requires cross-reference stream authority",
+                    "compressed entries and null authority cannot be written to a classic cross-reference table",
                 ));
             }
             // Write section range
@@ -219,6 +223,13 @@ impl XrefSection {
 }
 
 pub use crate::parser_aux::{decode_xref_stream, decode_xref_stream_with_limit};
+
+pub(crate) fn null_serialization_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "null cross-reference authority must be normalized before serialization",
+    )
+}
 
 /// Encode a field value as big-endian bytes with specified width
 fn encode_field(value: u64, width: usize, output: &mut Vec<u8>) {
@@ -273,6 +284,7 @@ impl<'a> XrefStreamBuilder<'a> {
                     max_gen = max_gen.max(*generation);
                 }
                 XrefEntry::UnusableFree => max_gen = u16::MAX,
+                XrefEntry::Null => {}
             }
         }
 
@@ -298,7 +310,7 @@ impl<'a> XrefStreamBuilder<'a> {
         self.entries.sort_by_key(|(id, _)| *id);
 
         for (_, entry) in &self.entries {
-            let encoded = entry.encode_for_xref_stream(&self.widths);
+            let encoded = entry.encode_for_xref_stream(&self.widths)?;
             content.extend_from_slice(&encoded);
         }
 
