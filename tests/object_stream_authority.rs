@@ -268,3 +268,95 @@ fn container_type_controls_encrypted_and_deferred_materialization() {
         }
     }
 }
+
+fn compressed_container_fixture(containers: &[u32], root: u32, encrypted: bool) -> Vec<u8> {
+    let mut bytes = fixture(Some(XrefEntry::Compressed { container: 8, index: 0 }), false);
+    let mut encryption = String::new();
+    if encrypted {
+        let mut doc = Document::load_mem(&bytes).unwrap();
+        encrypt_container(&mut doc);
+        let id = doc.trailer.get(b"Encrypt").unwrap().as_reference().unwrap();
+        encryption = format!("/Encrypt {} {} R /ID [(identifier)(identifier)]", id.0, id.1);
+        bytes.clear();
+        doc.save_to(&mut bytes).unwrap();
+    }
+    let prev: usize = String::from_utf8_lossy(&bytes)
+        .rsplit("startxref\n")
+        .next()
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let catalog = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 5 0 R >>\nendobj\n");
+    // Also exercise the parser's ordinary indirect stream-length lookup.
+    let stream = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Length 5 0 R >>\nstream\nx\nendstream\nendobj\n");
+    let start = bytes.len();
+    let mut records = vec![(2, 1u8, catalog as u32, 0u16), (3, 1, stream as u32, 0)];
+    for (ordinal, &container) in containers.iter().enumerate() {
+        let member = if ordinal == 0 { 5 } else { 19 + ordinal as u32 };
+        records.push((member, 2, container, 0));
+    }
+    let xref_id = 20 + containers.len() as u32;
+    records.push((xref_id, 1, start as u32, 0));
+    let index = records
+        .iter()
+        .map(|r| format!("{} 1", r.0))
+        .collect::<Vec<_>>()
+        .join(" ");
+    bytes.extend_from_slice(format!("{xref_id} 0 obj\n<< /Type /XRef /Size {} /Root {root} 0 R /Info 5 0 R {encryption} /Prev {prev} /W [1 4 2] /Index [{index}] /Length {} >>\nstream\n", xref_id + 1, records.len() * 7).as_bytes());
+    for (_, kind, field, generation) in records {
+        bytes.push(kind);
+        bytes.extend_from_slice(&field.to_be_bytes());
+        bytes.extend_from_slice(&generation.to_be_bytes());
+    }
+    bytes.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{start}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn assert_compressed_containers_rejected(containers: &[u32]) {
+    for root in [2, 5] {
+        for encrypted in [false, true] {
+            let bytes = compressed_container_fixture(containers, root, encrypted);
+            let options = LoadOptions::with_password("user");
+            let metadata = Document::load_metadata_mem_with_password(&bytes, "user").unwrap();
+            assert_eq!(metadata.encrypted, encrypted);
+            assert_eq!(metadata.title, None);
+            assert_eq!(metadata.page_count, 0);
+            let doc = Document::load_mem_with_options(&bytes, options).unwrap();
+            for ordinal in 0..containers.len() {
+                let id = if ordinal == 0 { 5 } else { 19 + ordinal as u32 };
+                assert!(matches!(
+                    doc.reference_table.get(id),
+                    Some(XrefEntry::Compressed { .. })
+                ));
+                assert!(!doc.objects.contains_key(&(id, 0)), "materialized {id}");
+            }
+        }
+    }
+}
+
+#[test]
+fn self_compressed_container_is_rejected() {
+    assert_compressed_containers_rejected(&[5]);
+}
+
+#[test]
+fn mutual_compressed_containers_are_rejected() {
+    assert_compressed_containers_rejected(&[20, 5]);
+}
+
+#[test]
+fn three_compressed_container_cycle_is_rejected() {
+    assert_compressed_containers_rejected(&[20, 21, 5]);
+}
+
+#[test]
+fn long_compressed_container_chain_is_rejected() {
+    let mut containers: Vec<u32> = (20..83).collect();
+    containers.push(8);
+    assert_compressed_containers_rejected(&containers);
+}

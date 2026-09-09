@@ -1138,6 +1138,9 @@ impl Reader<'_> {
         };
 
         let container_id = (container_id, 0);
+        // A stream cannot be an object-stream member. Require direct authority
+        // before resolving the container, so compressed-container chains cannot recurse.
+        self.get_offset(container_id)?;
         let mut already_seen = HashSet::new();
         let container_obj = self.get_object(container_id, &mut already_seen)?;
         let container_stream = container_obj.as_stream()?;
