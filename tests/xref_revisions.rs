@@ -84,7 +84,7 @@ fn invalid_newest_stream_index_preserves_older_authority_for_both_loaders() {
                 Some(XrefEntry::Free { generation: 65535, .. })
             ));
             assert!(doc.reference_table.get(u32::MAX).is_none());
-            assert_eq!(doc.reference_table.size, 6);
+            assert_eq!(doc.reference_table.size, 9);
             assert_eq!(
                 doc.get_dictionary((5, 0))
                     .unwrap()

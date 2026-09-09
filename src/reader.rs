@@ -784,7 +784,8 @@ impl Reader<'_> {
         let (xref, trailer) = self.resolve_authoritative_xref_and_trailer()?;
 
         self.document.version = version;
-        self.document.max_id = xref.size - 1;
+        // Trailer capacity does not reserve object numbers for allocation.
+        self.document.max_id = xref.max_id();
         self.document.trailer = trailer;
         self.set_reference_table(xref);
 
@@ -800,7 +801,7 @@ impl Reader<'_> {
         }
 
         // Object-stream members join `objects` only during loading, after
-        // `max_id` was derived from the xref size. Keep the ceiling at least
+        // `max_id` was derived from the effective xref entries. Keep the ceiling at least
         // at the highest loaded object so new ids cannot collide with live ones.
         if let Some(&max_loaded_id) = self.document.objects.keys().next_back() {
             self.document.max_id = self.document.max_id.max(max_loaded_id.0);
@@ -1371,6 +1372,14 @@ impl Reader<'_> {
                 }
             })?;
 
+        let size_bound = u32::try_from(
+            trailer
+                .get(b"Size")
+                .and_then(Object::as_i64)
+                .map_err(|_| ParseError::InvalidTrailer)?,
+        )
+        .map_err(|_| ParseError::InvalidTrailer)?;
+
         // Some authoritative section must end at the final footer. In a fresh
         // linearized file this is the main section, not the entry section.
         // Use parsed ends so marker bytes in values cannot establish authority.
@@ -1462,14 +1471,9 @@ impl Reader<'_> {
         }
         trailer.remove(b"Prev");
         trailer.remove(b"XRefStm");
-        let xref_entry_count = xref.max_id().checked_add(1).ok_or(ParseError::InvalidXref)?;
-        if xref.size != xref_entry_count {
-            warn!(
-                "Size entry of trailer dictionary is {}, correct value is {}.",
-                xref.size, xref_entry_count
-            );
-            xref.size = xref_entry_count;
-        }
+        // The authoritative trailer bounds entries from every revision and supplement.
+        xref.entries.retain(|&id, _| id < size_bound);
+        xref.size = size_bound;
 
         Ok((xref, trailer))
     }
@@ -1782,7 +1786,7 @@ endstream endobj\n",
     );
     let doc = format!(
         "{}xref
-0 7
+0 8
 0000000000 65535 f 
 0000000009 00000 n 
 0000000096 00000 n 
@@ -1792,7 +1796,7 @@ endstream endobj\n",
 0000000254 00000 n 
 0000000297 00000 n 
 trailer
-<</Root 6 0 R/Size 7>>
+<</Root 6 0 R/Size 8>>
 startxref
 {}
 %%EOF",

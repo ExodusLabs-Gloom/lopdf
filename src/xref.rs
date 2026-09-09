@@ -11,7 +11,9 @@ pub struct Xref {
     /// Entries for indirect object.
     pub entries: BTreeMap<u32, XrefEntry>,
 
-    /// Total number of entries (including free entries), equal to the highest object number plus 1.
+    /// Object number upper bound (exclusive). For a loaded document, this is the
+    /// authoritative trailer's Size, which may exceed the highest entry plus 1.
+    /// During section construction, insertion also raises this to cover inserted ids.
     pub size: u32,
 }
 
