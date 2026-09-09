@@ -82,6 +82,10 @@ impl SaveOptionsBuilder {
 
     /// Set maximum objects per stream
     ///
+    /// This is a requested maximum: generated streams may be split below it.
+    /// lopdf currently limits generated streams to 65,536 members so their type-2
+    /// member indices fit its `u16` representation; this is not a PDF format limit.
+    ///
     /// A value of zero is normalized to the default capacity, so a configuration
     /// produced by this builder always holds objects.
     pub fn max_objects_per_stream(mut self, value: usize) -> Self {

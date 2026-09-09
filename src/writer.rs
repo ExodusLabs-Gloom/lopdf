@@ -186,6 +186,12 @@ impl Document {
         Writer::write_binary_mark(&mut target, &self.binary_mark)?;
 
         // Organize objects into streams
+        // Generated type-2 member indices must fit lopdf's u16 representation.
+        const MAX_GENERATED_OBJECT_STREAM_MEMBERS: usize = u16::MAX as usize + 1;
+        let effective_max = options
+            .object_stream_config
+            .max_objects_per_stream
+            .min(MAX_GENERATED_OBJECT_STREAM_MEMBERS);
         let mut object_streams: Vec<crate::ObjectStream> = Vec::new();
         let mut objects_to_write_directly = Vec::new();
         let mut object_to_stream_map = HashMap::new();
@@ -206,13 +212,10 @@ impl Document {
                 // Find or create an object stream for it
                 let stream_index = object_streams.len().saturating_sub(1);
 
-                if object_streams.is_empty()
-                    || object_streams[stream_index].object_count()
-                        >= options.object_stream_config.max_objects_per_stream
-                {
+                if object_streams.is_empty() || object_streams[stream_index].object_count() >= effective_max {
                     // Create new object stream
                     let new_stream = ObjectStream::builder()
-                        .max_objects(options.object_stream_config.max_objects_per_stream)
+                        .max_objects(effective_max)
                         .compression_level(options.object_stream_config.compression_level)
                         .build();
                     object_streams.push(new_stream);
@@ -252,7 +255,7 @@ impl Document {
                     *obj_id,
                     XrefEntry::Compressed {
                         container: stream_id,
-                        index: index_in_stream as u16,
+                        index: u16::try_from(index_in_stream).map_err(std::io::Error::other)?,
                     },
                 );
             }
