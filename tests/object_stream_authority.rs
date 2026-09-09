@@ -360,3 +360,103 @@ fn long_compressed_container_chain_is_rejected() {
     containers.push(8);
     assert_compressed_containers_rejected(&containers);
 }
+
+fn indirect_length_fixture(length_ref: Option<u32>, encrypted: bool) -> Vec<u8> {
+    let mut doc = Document::load_mem(&fixture(Some(XrefEntry::Compressed { container: 8, index: 0 }), false)).unwrap();
+    if encrypted {
+        encrypt_container(&mut doc);
+    }
+    let content = doc.get_object((8, 0)).unwrap().as_stream().unwrap().content.clone();
+    let encryption = if encrypted {
+        let id = doc.trailer.get(b"Encrypt").unwrap().as_reference().unwrap();
+        format!("/Encrypt {} {} R /ID [(identifier)(identifier)]", id.0, id.1)
+    } else {
+        String::new()
+    };
+    set_container_type(&mut doc, Some("Unused"));
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let prev: usize = String::from_utf8_lossy(&bytes)
+        .rsplit("startxref\n")
+        .next()
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let length = length_ref.map_or_else(|| content.len().to_string(), |id| format!("{id} 0 R"));
+    let container_offset = bytes.len();
+    bytes
+        .extend_from_slice(format!("8 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {length} >>\nstream\n").as_bytes());
+    bytes.extend_from_slice(&content);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let length_offset = bytes.len();
+    bytes.extend_from_slice(format!("9 0 obj\n{}\nendobj\n", content.len()).as_bytes());
+    let start = bytes.len();
+    // Member 6 shares the normal container, so /Length 6 re-enters active container 8.
+    let records = [
+        (2u8, 8u32, 0u16),
+        (2, 8, 1),
+        (1, container_offset as u32, 0),
+        (1, length_offset as u32, 0),
+        (1, start as u32, 0),
+    ];
+    bytes.extend_from_slice(format!("20 0 obj\n<< /Type /XRef /Size 21 /Root 1 0 R /Info 5 0 R {encryption} /Prev {prev} /W [1 4 2] /Index [5 2 8 2 20 1] /Length 35 >>\nstream\n").as_bytes());
+    for (kind, field, generation) in records {
+        bytes.push(kind);
+        bytes.extend_from_slice(&field.to_be_bytes());
+        bytes.extend_from_slice(&generation.to_be_bytes());
+    }
+    bytes.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{start}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+#[test]
+fn object_stream_indirect_length_cycles_terminate() {
+    for length_ref in [5, 6] {
+        for encrypted in [false, true] {
+            let bytes = indirect_length_fixture(Some(length_ref), encrypted);
+            let metadata = Document::load_metadata_mem_with_password(&bytes, "user").unwrap();
+            assert_eq!(metadata.encrypted, encrypted);
+            assert_eq!(metadata.title, None);
+            let doc = Document::load_mem_with_options(&bytes, LoadOptions::with_password("user")).unwrap();
+            assert!(matches!(
+                doc.reference_table.get(5),
+                Some(XrefEntry::Compressed { container: 8, index: 0 })
+            ));
+            assert!(matches!(
+                doc.reference_table.get(8),
+                Some(XrefEntry::Normal { generation: 0, .. })
+            ));
+            assert!(!doc.objects.contains_key(&(5, 0)));
+            assert!(!doc.objects.contains_key(&(6, 0)));
+            if !encrypted {
+                assert_eq!(Document::load_metadata_mem(&bytes).unwrap().title, None);
+                assert!(!Document::load_mem(&bytes).unwrap().objects.contains_key(&(5, 0)));
+            }
+        }
+    }
+}
+
+#[test]
+fn object_stream_direct_and_indirect_lengths_resolve() {
+    for length_ref in [None, Some(9)] {
+        for encrypted in [false, true] {
+            let bytes = indirect_length_fixture(length_ref, encrypted);
+            let metadata = Document::load_metadata_mem_with_password(&bytes, "user").unwrap();
+            assert_eq!(metadata.encrypted, encrypted);
+            assert_eq!(metadata.title.as_deref(), Some("copy 8"));
+            let doc = Document::load_mem_with_options(&bytes, LoadOptions::with_password("user")).unwrap();
+            assert_eq!(
+                doc.get_dictionary((5, 0))
+                    .unwrap()
+                    .get(b"Title")
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                b"copy 8"
+            );
+        }
+    }
+}

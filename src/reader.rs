@@ -1129,7 +1129,7 @@ impl Reader<'_> {
     }
 
     /// Load a compressed object from an object stream (for lightweight metadata extraction)
-    fn get_compressed_object(&self, id: ObjectId) -> Result<Object> {
+    fn get_compressed_object(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
         let entry = self.document.reference_table.get(id.0).ok_or(Error::MissingXrefEntry)?;
 
         let (container_id, index) = match entry {
@@ -1141,8 +1141,7 @@ impl Reader<'_> {
         // A stream cannot be an object-stream member. Require direct authority
         // before resolving the container, so compressed-container chains cannot recurse.
         self.get_offset(container_id)?;
-        let mut already_seen = HashSet::new();
-        let container_obj = self.get_object(container_id, &mut already_seen)?;
+        let container_obj = self.get_object(container_id, already_seen)?;
         let container_stream = container_obj.as_stream()?;
         if !container_stream.dict.has_type(b"ObjStm") {
             return Err(Error::InvalidObjectStream("container must have /Type /ObjStm".into()));
@@ -1165,7 +1164,7 @@ impl Reader<'_> {
         if let Some(entry) = self.document.reference_table.get(id.0)
             && matches!(entry, XrefEntry::Compressed { .. })
         {
-            return self.get_compressed_object(id);
+            return self.get_compressed_object(id, already_seen);
         }
 
         let offset = self.get_offset(id)?;
