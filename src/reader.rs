@@ -587,7 +587,7 @@ impl Reader<'_> {
 
         let version = parser::header(self.buffer, self.strict).ok_or(ParseError::InvalidFileHeader)?;
 
-        let (xref, trailer) = self.resolve_authoritative_xref_and_trailer()?;
+        let (xref, trailer) = self.resolve_authoritative_xref_and_trailer(&version)?;
 
         self.set_reference_table(xref);
         self.document.trailer = trailer.clone();
@@ -781,7 +781,7 @@ impl Reader<'_> {
             self.document.binary_mark = binary_mark;
         }
 
-        let (xref, trailer) = self.resolve_authoritative_xref_and_trailer()?;
+        let (xref, trailer) = self.resolve_authoritative_xref_and_trailer(&version)?;
 
         self.document.version = version;
         // Trailer capacity does not reserve object numbers for allocation.
@@ -1341,8 +1341,8 @@ impl Reader<'_> {
     /// when only one revision is apparent: an xref may free a physically present
     /// object or authorize a different generation or compressed member.
     /// Only recovery that resolves actual xref sections is supported.
-    fn resolve_authoritative_xref_and_trailer(&mut self) -> Result<(Xref, Dictionary)> {
-        self.resolve_xref_and_trailer().map_err(|err| match err {
+    fn resolve_authoritative_xref_and_trailer(&mut self, header_version: &str) -> Result<(Xref, Dictionary)> {
+        self.resolve_xref_and_trailer(header_version).map_err(|err| match err {
             // Preserve strict-mode diagnostics and established topology errors.
             Error::Xref(XrefError::PrevStart | XrefError::StreamStart | XrefError::AmbiguousStart) => err,
             // Resource/decoder failures already require explicit failure.
@@ -1356,7 +1356,7 @@ impl Reader<'_> {
 
     /// Resolve the cross-reference table/stream and trailer, including the
     /// `/Prev` chain, and record the resolved start offset on the document.
-    fn resolve_xref_and_trailer(&mut self) -> Result<(Xref, Dictionary)> {
+    fn resolve_xref_and_trailer(&mut self, header_version: &str) -> Result<(Xref, Dictionary)> {
         let xref_start = Self::get_xref_start(self.buffer)?;
         if xref_start > self.buffer.len() {
             return Err(Error::Xref(XrefError::Start));
@@ -1399,8 +1399,22 @@ impl Reader<'_> {
         let mut current = xref_start;
         loop {
             if let Ok(value) = revision_trailer.get(b"XRefStm") {
-                if !matches!(revision_type, XrefType::CrossReferenceTable) || !revision_trailer.has(b"Prev") {
+                if !matches!(revision_type, XrefType::CrossReferenceTable) {
                     return Err(Error::Xref(XrefError::StreamStart));
+                }
+                // ISO 32000-1:2008 7.5.8.4 prohibited /XRefStm in the main section;
+                // ISO 32000-2 removed that prohibition. Before xref resolution, only
+                // the header version is available. Catalog /Version may raise the
+                // effective version, but needs resolved xref state and is outside this check.
+                let pdf_2_or_later = header_version
+                    .split_once('.')
+                    .and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)))
+                    .is_some_and(|version| version >= (2, 0));
+                if !revision_trailer.has(b"Prev") && !pdf_2_or_later {
+                    if self.strict {
+                        return Err(Error::Xref(XrefError::StreamStart));
+                    }
+                    warn!("First cross-reference section contains /XRefStm without /Prev; accepting in lenient mode");
                 }
                 let offset = value
                     .as_i64()

@@ -492,7 +492,7 @@ fn stream_free_shadows_previous_live() {
 }
 
 #[test]
-fn hybrid_requires_previous_revision_and_preserves_main_section_precedence() {
+fn updated_hybrid_preserves_main_section_precedence() {
     for main_entry in [false, true] {
         let mut bytes = b"%PDF-1.5\n".to_vec();
         let previous = section(&mut bytes, "0000000000 00001 f ", "");
@@ -510,15 +510,167 @@ fn hybrid_requires_previous_revision_and_preserves_main_section_precedence() {
         } else {
             String::new()
         };
-        bytes.extend_from_slice(format!("xref\n0 1\n0000000000 65535 f \n{entries}trailer\n<< /Size 9 /XRefStm {supplement} >>\nstartxref\n{current}\n%%EOF\n").as_bytes());
-        assert!(Document::load_mem(&bytes).is_err());
-        bytes.truncate(current);
         bytes.extend_from_slice(format!("xref\n0 1\n0000000000 65535 f \n{entries}trailer\n<< /Size 9 /XRefStm {supplement} /Prev {previous} >>\nstartxref\n{current}\n%%EOF\n").as_bytes());
-        let doc = Document::load_mem(&bytes).unwrap();
+        let doc = Document::load_mem_with_options(
+            &bytes,
+            lopdf::LoadOptions {
+                strict: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             doc.get_object((5, 0)).unwrap().as_str().unwrap(),
             if main_entry { &b"main"[..] } else { &b"supplement"[..] }
         );
+    }
+}
+
+fn first_revision_hybrid(version: &str, target: &str) -> (Vec<u8>, usize) {
+    let mut bytes = format!("%PDF-{version}\n").into_bytes();
+    let catalog = object(&mut bytes, 1, 0, "<< /Type /Catalog /Pages 2 0 R >>");
+    let pages = object(&mut bytes, 2, 0, "<< /Type /Pages /Kids [] /Count 0 >>");
+    let info = object(&mut bytes, 5, 0, "<< /Title (supplement value) >>");
+    let supplement = bytes.len();
+    if target == "object" {
+        object(&mut bytes, 8, 0, "(not a stream)");
+    } else {
+        let stream_type = if target == "wrong type" { "ObjStm" } else { "XRef" };
+        let widths = if target == "bad widths" { "1 4" } else { "1 4 2" };
+        bytes.extend_from_slice(
+            format!("8 0 obj\n<< /Type /{stream_type} /Size 9 /W [{widths}] /Index [5 1] /Length 7 >>\nstream\n")
+                .as_bytes(),
+        );
+        bytes.push(1);
+        bytes.extend_from_slice(&(info as u32).to_be_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+    let current = bytes.len();
+    let offset = match target {
+        "outside" => "9999999999".to_owned(),
+        "negative" => "-1".to_owned(),
+        "self" => current.to_string(),
+        _ => supplement.to_string(),
+    };
+    // Object 5 is absent unless the main table explicitly frees it.
+    let main_entry = if target == "main free" {
+        "5 1\n0000000000 00001 f \n"
+    } else {
+        ""
+    };
+    bytes.extend_from_slice(format!("xref\n0 3\n0000000000 65535 f \n{}\n{}\n{main_entry}8 1\n{}\ntrailer\n<< /Size 9 /Root 1 0 R /Info 5 0 R /XRefStm {offset} >>\nstartxref\n{current}\n%%EOF\n", normal(catalog, 0), normal(pages, 0), normal(supplement, 0)).as_bytes());
+    (bytes, info)
+}
+
+fn assert_stream_start(error: lopdf::Error) {
+    assert!(
+        matches!(error, lopdf::Error::Xref(ref err) if format!("{err:?}") == "StreamStart"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn first_revision_hybrid_processes_supplement_in_lenient_mode() {
+    for version in ["1.7", "2.0"] {
+        let (bytes, info) = first_revision_hybrid(version, "valid");
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert_eq!(doc.version, version);
+        assert_eq!(
+            doc.get_dictionary((5, 0))
+                .unwrap()
+                .get(b"Title")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            b"supplement value"
+        );
+        assert!(
+            matches!(doc.reference_table.get(5), Some(XrefEntry::Normal { offset, generation: 0 }) if *offset as usize == info)
+        );
+        assert_eq!(
+            Document::load_metadata_mem(&bytes).unwrap().title.as_deref(),
+            Some("supplement value")
+        );
+    }
+}
+
+#[test]
+fn first_revision_hybrid_is_rejected_in_strict_mode() {
+    let (bytes, _) = first_revision_hybrid("1.7", "valid");
+    assert_stream_start(
+        Document::load_mem_with_options(
+            &bytes,
+            lopdf::LoadOptions {
+                strict: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err(),
+    );
+}
+
+#[test]
+fn pdf_2_first_revision_hybrid_is_accepted_in_strict_mode() {
+    let (bytes, info) = first_revision_hybrid("2.0", "valid");
+    let doc = Document::load_mem_with_options(
+        &bytes,
+        lopdf::LoadOptions {
+            strict: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(doc.version, "2.0");
+    assert!(
+        matches!(doc.reference_table.get(5), Some(XrefEntry::Normal { offset, generation: 0 }) if *offset as usize == info)
+    );
+    assert_eq!(
+        doc.get_dictionary((5, 0))
+            .unwrap()
+            .get(b"Title")
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        b"supplement value"
+    );
+}
+
+#[test]
+fn first_revision_main_free_blocks_supplement() {
+    for (version, strict) in [("1.7", false), ("2.0", false), ("2.0", true)] {
+        let (bytes, _) = first_revision_hybrid(version, "main free");
+        let doc = Document::load_mem_with_options(
+            &bytes,
+            lopdf::LoadOptions {
+                strict,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(doc.reference_table.get(5), Some(XrefEntry::Free { .. })));
+        assert!(doc.get_object((5, 0)).is_err());
+    }
+}
+
+#[test]
+fn malformed_first_revision_supplements_fail_closed() {
+    for version in ["1.7", "2.0"] {
+        for target in ["outside", "negative", "object", "wrong type", "bad widths", "self"] {
+            let (bytes, _) = first_revision_hybrid(version, target);
+            assert_stream_start(Document::load_mem(&bytes).unwrap_err());
+            assert_stream_start(Document::load_metadata_mem(&bytes).unwrap_err());
+            assert_stream_start(
+                Document::load_mem_with_options(
+                    &bytes,
+                    lopdf::LoadOptions {
+                        strict: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err(),
+            );
+        }
     }
 }
 
