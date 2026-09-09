@@ -10,6 +10,99 @@ use std::io::Write;
 use flate2::{Compression, write::ZlibEncoder};
 use lopdf::{Document, Error, LoadOptions, ParseError, SaveOptions, Stream, dictionary};
 
+#[test]
+fn malformed_index_structure_is_rejected_atomically() {
+    use lopdf::{Object, xref::decode_xref_stream};
+    let arrays: Vec<Vec<Object>> = vec![
+        vec![(-1).into(), 3.into(), 5.into(), 1.into()],
+        vec![0.into(), (-1).into()],
+        vec![0.into(), 1.into(), 2.into()],
+        vec![0.into(), Object::Real(1.0)],
+        vec![0.into(), Object::Reference((1, 0))],
+        vec![i64::MAX.into(), 1.into()],
+        vec![(i64::from(u32::MAX) + 1).into(), 1.into()],
+        vec![3.into(), 2.into()],
+        vec![0.into(), 2.into(), 1.into(), 1.into()],
+        vec![2.into(), 1.into(), 0.into(), 1.into()],
+        vec![0.into(), 3.into(), 1.into(), 0.into(), 2.into(), 1.into()],
+        vec![5.into(), 0.into()],
+    ];
+    for index in
+        arrays
+            .into_iter()
+            .map(Object::Array)
+            .chain([Object::Integer(0), Object::Null, Object::Reference((1, 0))])
+    {
+        let stream = Stream::new(
+            dictionary! {
+                "Size" => 4, "W" => vec![1.into(), 1.into(), 1.into()], "Index" => index.clone(),
+            },
+            vec![1; 30],
+        );
+        assert!(
+            matches!(decode_xref_stream(stream), Err(Error::Parse(ParseError::InvalidXref))),
+            "{index:?}"
+        );
+    }
+}
+
+#[test]
+fn malformed_local_stream_size_is_rejected() {
+    use lopdf::{Object, xref::decode_xref_stream};
+    for size in [
+        Object::Integer(-1),
+        Object::Integer(i64::from(u32::MAX) + 1),
+        Object::Real(4.0),
+        Object::Reference((1, 0)),
+    ] {
+        for explicit in [false, true] {
+            let mut dict = dictionary! { "Size" => size.clone(), "W" => vec![1.into(), 1.into(), 1.into()] };
+            if explicit {
+                dict.set("Index", vec![0.into(), 1.into()]);
+            }
+            assert!(matches!(
+                decode_xref_stream(Stream::new(dict, vec![1, 9, 0])),
+                Err(Error::Parse(ParseError::InvalidXref))
+            ));
+        }
+    }
+    assert!(
+        decode_xref_stream(Stream::new(
+            dictionary! { "W" => vec![1.into(), 1.into(), 1.into()] },
+            vec![]
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn valid_index_ranges_and_absent_default_preserve_record_identity() {
+    use lopdf::xref::{XrefEntry, decode_xref_stream};
+    for index in [
+        None,
+        Some(vec![0.into(), 1.into(), 1.into(), 0.into(), 1.into(), 2.into()]),
+    ] {
+        let mut dict = dictionary! { "Size" => 3, "W" => vec![1.into(), 1.into(), 1.into()] };
+        if let Some(index) = index {
+            dict.set("Index", index);
+        }
+        let (xref, _) = decode_xref_stream(Stream::new(dict, vec![0, 0, 255, 1, 9, 0, 1, 42, 0])).unwrap();
+        assert_eq!(xref.entries.len(), 3);
+        assert!(matches!(xref.get(0), Some(XrefEntry::Free { .. })));
+        assert!(matches!(xref.get(1), Some(XrefEntry::Normal { offset: 9, .. })));
+        assert!(matches!(xref.get(2), Some(XrefEntry::Normal { offset: 42, .. })));
+    }
+    let (xref, _) = decode_xref_stream(Stream::new(
+        dictionary! {
+            "Size" => 6, "W" => vec![1.into(), 1.into(), 1.into()],
+            "Index" => vec![1.into(), 2.into(), 2.into(), 0.into(), 5.into(), 1.into(), 6.into(), 0.into()],
+        },
+        vec![1, 9, 0, 1, 42, 0, 1, 77, 0],
+    ))
+    .unwrap();
+    assert_eq!(xref.entries.keys().copied().collect::<Vec<_>>(), vec![1, 2, 5]);
+}
+
 /// A PDF whose only cross-reference is an xref stream with the given `/W` widths,
 /// `/Index [0 count]`, and `body` as an uncompressed stream body.
 fn xref_stream_pdf(w: [i64; 3], count: i64, body: &[u8]) -> Vec<u8> {

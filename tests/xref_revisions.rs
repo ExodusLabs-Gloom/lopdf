@@ -24,8 +24,105 @@ fn normal(offset: usize, generation: u16) -> String {
     format!("{offset:010} {generation:05} n ")
 }
 
+fn indexed_authority_pdf(index: &str, size: i64, placement: u8) -> Vec<u8> {
+    let mut bytes = b"%PDF-2.0\n".to_vec();
+    let root = object(&mut bytes, 1, 0, "<< /Type /Catalog >>");
+    let stale = object(&mut bytes, 5, 0, "<< /Title (stale physical content) >>");
+    let stream_start = bytes.len();
+    let records = if index == "-1 3 5 1 8 1" {
+        vec![(0, 0), (0, 0), (1, root), (1, stale), (1, stream_start)]
+    } else if index == "5 1" {
+        vec![(1, stale)]
+    } else {
+        vec![(0, 0), (1, root), (1, stale), (1, stream_start)]
+    };
+    bytes.extend_from_slice(format!("8 0 obj\n<< /Type /XRef /Size {size} /W [1 4 2] /Index [{index}] /Root 1 0 R /Info 5 0 R /Length {} >>\nstream\n", records.len() * 7).as_bytes());
+    for (kind, offset) in records {
+        bytes.push(kind);
+        bytes.extend_from_slice(&u32::try_from(offset).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+    }
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    if placement == 0 {
+        bytes.extend_from_slice(format!("startxref\n{stream_start}\n%%EOF\n").as_bytes());
+    } else {
+        if placement == 2 {
+            bytes.extend_from_slice(format!("startxref\n{stream_start}\n%%EOF\n").as_bytes());
+        }
+        let main = bytes.len();
+        let link = if placement == 1 { "XRefStm" } else { "Prev" };
+        bytes.extend_from_slice(format!("xref\n0 2\n0000000000 65535 f \n{}\ntrailer\n<< /Size 9 /Root 1 0 R /Info 5 0 R /{link} {stream_start} >>\nstartxref\n{main}\n%%EOF\n", normal(root, 0)).as_bytes());
+    }
+    bytes
+}
+
+fn assert_index_authority_failure(bytes: &[u8], placement: u8) {
+    for strict in [false, true] {
+        let error = Document::load_mem_with_options(
+            bytes,
+            lopdf::LoadOptions {
+                strict,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_index_error(error, placement, strict);
+    }
+    assert_index_error(Document::load_metadata_mem(bytes).unwrap_err(), placement, false);
+    assert_index_error(
+        Document::load_metadata_mem_with_password(bytes, "").unwrap_err(),
+        placement,
+        false,
+    );
+}
+
+fn assert_index_error(error: lopdf::Error, placement: u8, strict: bool) {
+    use lopdf::{Error, ParseError};
+    match (placement, strict, error) {
+        (0, true, Error::Parse(ParseError::InvalidXref)) => {}
+        (0, false, Error::ReconstructionAuthority { source })
+            if matches!(*source, Error::Parse(ParseError::InvalidXref)) => {}
+        (1, _, Error::Xref(error)) => assert_eq!(format!("{error:?}"), "StreamStart"),
+        (2, _, Error::Xref(error)) => assert_eq!(format!("{error:?}"), "PrevStart"),
+        (_, _, error) => panic!("unexpected indexing error: {error:?}"),
+    }
+}
+
 #[test]
-fn stream_index_object_numbers_are_checked_before_insertion() {
+fn malformed_index_cannot_expose_stale_content_in_any_revision_position() {
+    for placement in 0..=2 {
+        let valid = indexed_authority_pdf("0 2 5 1 8 1", 9, placement);
+        for strict in [false, true] {
+            let doc = Document::load_mem_with_options(
+                &valid,
+                lopdf::LoadOptions {
+                    strict,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(doc.get_object((5, 0)).is_ok());
+        }
+        assert_eq!(
+            Document::load_metadata_mem(&valid).unwrap().title.as_deref(),
+            Some("stale physical content")
+        );
+        assert_index_authority_failure(&indexed_authority_pdf("-1 3 5 1 8 1", 9, placement), placement);
+    }
+}
+
+#[test]
+fn supplement_local_size_is_checked_before_merge() {
+    for size in [-1, i64::from(u32::MAX) + 1, 4] {
+        assert_index_authority_failure(&indexed_authority_pdf("5 1", size, 1), 1);
+    }
+    // A different but sufficient local bound does not impose Size equality.
+    let bytes = indexed_authority_pdf("5 1", 8, 1);
+    assert!(Document::load_mem(&bytes).unwrap().get_object((5, 0)).is_ok());
+}
+
+#[test]
+fn invalid_stream_index_rejects_all_entries() {
     for start in [1_i64 << 32, (1_i64 << 32) + 5, -1, i64::MAX - 1] {
         for entry_type in 0..=2 {
             let stream = Stream::new(
@@ -36,30 +133,16 @@ fn stream_index_object_numbers_are_checked_before_insertion() {
                 },
                 vec![entry_type, 7, 0, entry_type, 8, 0, entry_type, 9, 0, 1, 42, 0],
             );
-            let (xref, _) = decode_xref_stream(stream).unwrap();
-            // A negative start can cross into valid IDs; validate each record independently.
-            assert_eq!(xref.entries.len(), if start == -1 { 3 } else { 1 });
-            assert_eq!(xref.size, 6);
-            assert!(xref.get(u32::MAX).is_none());
             assert!(matches!(
-                xref.get(5),
-                Some(XrefEntry::Normal {
-                    offset: 42,
-                    generation: 0
-                })
+                decode_xref_stream(stream),
+                Err(lopdf::Error::Parse(lopdf::ParseError::InvalidXref))
             ));
-            if start == -1 {
-                assert!(xref.get(0).is_some());
-                assert!(xref.get(1).is_some());
-            } else {
-                assert!(xref.get(0).is_none());
-            }
         }
     }
 }
 
 #[test]
-fn invalid_newest_stream_index_preserves_older_authority_for_both_loaders() {
+fn invalid_newest_stream_index_fails_for_both_loaders() {
     for start in [1_i64 << 32, (1_i64 << 32) + 5, -1, i64::MAX - 1] {
         for entry_type in 0..=2 {
             let mut bytes = b"%PDF-1.5\n".to_vec();
@@ -75,29 +158,7 @@ fn invalid_newest_stream_index_preserves_older_authority_for_both_loaders() {
                 bytes.extend_from_slice(&[entry_type, 0, 0]);
             }
             bytes.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{current}\n%%EOF\n").as_bytes());
-            let doc = Document::load_mem(&bytes).unwrap();
-            assert!(
-                matches!(doc.reference_table.get(5), Some(XrefEntry::Normal { offset, generation: 0 }) if usize::try_from(*offset).unwrap() == old)
-            );
-            assert!(matches!(
-                doc.reference_table.get(0),
-                Some(XrefEntry::Free { generation: 65535, .. })
-            ));
-            assert!(doc.reference_table.get(u32::MAX).is_none());
-            assert_eq!(doc.reference_table.size, 9);
-            assert_eq!(
-                doc.get_dictionary((5, 0))
-                    .unwrap()
-                    .get(b"Title")
-                    .unwrap()
-                    .as_str()
-                    .unwrap(),
-                b"authoritative"
-            );
-            assert_eq!(
-                Document::load_metadata_mem(&bytes).unwrap().title.as_deref(),
-                Some("authoritative")
-            );
+            assert_reconstruction_authority_lost(&bytes, "");
         }
     }
 }

@@ -21,9 +21,14 @@ fn table(bytes: &mut Vec<u8>, records: &[Record], size: u32, extra: &str) -> usi
 }
 
 fn stream(bytes: &mut Vec<u8>, records: &[Record], extra: &str) -> usize {
+    stream_with_size(bytes, records, 10, extra)
+}
+
+fn stream_with_size(bytes: &mut Vec<u8>, records: &[Record], size: u32, extra: &str) -> usize {
     let start = bytes.len();
     let mut records = records.to_vec();
     records.push((7, 1, start as u32, 0));
+    records.sort_by_key(|record| record.0);
     let index = records
         .iter()
         .map(|r| format!("{} 1", r.0))
@@ -31,7 +36,7 @@ fn stream(bytes: &mut Vec<u8>, records: &[Record], extra: &str) -> usize {
         .join(" ");
     bytes.extend_from_slice(
         format!(
-            "7 0 obj\n<< /Type /XRef /Size 10 /W [1 4 2] /Index [{index}] /Length {} {extra} >>\nstream\n",
+            "7 0 obj\n<< /Type /XRef /Size {size} /W [1 4 2] /Index [{index}] /Length {} {extra} >>\nstream\n",
             records.len() * 7
         )
         .as_bytes(),
@@ -106,6 +111,11 @@ fn stream_and_hybrid_respect_size_for_normal_and_compressed_objects() {
                 } else {
                     bytes.extend_from_slice(format!("startxref\n{supplement}\n%%EOF\n").as_bytes());
                 }
+                if id >= 10 {
+                    assert!(Document::load_mem(&bytes).is_err());
+                    assert!(Document::load_metadata_mem(&bytes).is_err());
+                    continue;
+                }
                 let doc = check(&bytes, id);
                 if compressed {
                     let physical = ObjectStream::new(doc.get_object((8, 0)).unwrap().as_stream().unwrap()).unwrap();
@@ -124,7 +134,7 @@ fn newest_size_bounds_older_tables_and_supplements() {
             let record = object(&mut bytes, id, "<< /Title (member) >>");
             let previous = if hybrid {
                 let first = table(&mut bytes, &[], 12, "");
-                let supplement = stream(&mut bytes, &[record], "");
+                let supplement = stream_with_size(&mut bytes, &[record], 12, "");
                 table(&mut bytes, &[], 10, &format!("/Prev {first} /XRefStm {supplement}"))
             } else {
                 table(&mut bytes, &[record], 12, "")
