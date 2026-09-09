@@ -90,12 +90,13 @@ impl Document {
         // Pick right cross reference stream.
         match xref.cross_reference_type {
             XrefType::CrossReferenceTable => {
+                self.normalize_full_save_xref(&mut xref);
                 Writer::write_xref(&mut target, &xref)?;
-                self.write_trailer(&mut target)?;
+                self.write_trailer(&mut target, xref.size)?;
             }
             XrefType::CrossReferenceStream => {
                 // Cross Reference Stream instead of XRef and Trailer
-                self.write_cross_reference_stream(&mut target, &mut xref, xref_start as u32)?;
+                self.write_cross_reference_stream(&mut target, &mut xref, xref_start as u32, true)?;
             }
         }
         // Write `startxref` part of trailer
@@ -217,11 +218,12 @@ impl Document {
         // Write cross-reference
         match xref.cross_reference_type {
             XrefType::CrossReferenceTable => {
+                self.normalize_full_save_xref(&mut xref);
                 Writer::write_xref(&mut target, &xref)?;
-                self.write_trailer(&mut target)?;
+                self.write_trailer(&mut target, xref.size)?;
             }
             XrefType::CrossReferenceStream => {
-                self.write_cross_reference_stream(&mut target, &mut xref, xref_start as u32)?;
+                self.write_cross_reference_stream(&mut target, &mut xref, xref_start as u32, true)?;
             }
         }
 
@@ -229,12 +231,62 @@ impl Document {
         Ok(())
     }
 
+    /// Rebuild a full rewrite's free list from effective identities and generations.
+    fn normalize_full_save_xref(&self, xref: &mut Xref) {
+        // Preserve allocation state, emitted IDs, and explicit effective Free IDs.
+        // Neither the input trailer's Size nor reference_table.size is output capacity.
+        let highest_free = self
+            .reference_table
+            .entries
+            .iter()
+            .filter_map(|(&id, entry)| matches!(entry, XrefEntry::Free { .. } | XrefEntry::UnusableFree).then_some(id))
+            .max()
+            .unwrap_or(0);
+        let output_max = self.max_id.max(xref.max_id()).max(highest_free);
+        let mut next_free = 0;
+        // Walking backwards builds ascending links without trusting source pointers.
+        for id in (1..=output_max).rev() {
+            if matches!(
+                xref.get(id),
+                Some(XrefEntry::Normal { .. } | XrefEntry::Compressed { .. })
+            ) {
+                continue;
+            }
+            let generation = match self.reference_table.get(id) {
+                Some(XrefEntry::Free { generation, .. }) => *generation,
+                Some(XrefEntry::UnusableFree) => u16::MAX,
+                Some(XrefEntry::Normal { generation, .. }) => generation.saturating_add(1),
+                Some(XrefEntry::Compressed { .. }) => 1,
+                None => 0,
+            };
+            let reusable = generation < u16::MAX;
+            xref.insert(
+                id,
+                XrefEntry::Free {
+                    next_free: if reusable { next_free } else { 0 },
+                    generation,
+                },
+            );
+            if reusable {
+                next_free = id;
+            }
+        }
+        xref.insert(
+            0,
+            XrefEntry::Free {
+                next_free,
+                generation: u16::MAX,
+            },
+        );
+        xref.size = output_max + 1;
+    }
+
     /// Write the Cross Reference Stream.
     ///
     /// Insert an `Object` to the end of the PDF (not visible when inspecting `Document`).
     /// Note: This is different from the "Cross Reference Table".
     fn write_cross_reference_stream<W: Write>(
-        &mut self, file: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: u32,
+        &mut self, file: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: u32, full_save: bool,
     ) -> Result<()> {
         // Increment max_id to account for CRS.
         self.max_id += 1;
@@ -246,9 +298,13 @@ impl Document {
                 generation: 0,
             },
         );
+        if full_save {
+            self.normalize_full_save_xref(xref);
+        }
         self.trailer.set("Type", Name(b"XRef".to_vec()));
         // Update `max_id` in trailer
-        self.trailer.set("Size", i64::from(self.max_id + 1));
+        self.trailer
+            .set("Size", i64::from(if full_save { xref.size } else { self.max_id + 1 }));
         // Set the size of each entry in bytes (default for PDFs is `[1 2 1]`)
         // In our case we use `[u8, u32, u16]` for each entry
         // to keep things simple and working at all times.
@@ -281,8 +337,8 @@ impl Document {
         Ok(())
     }
 
-    fn write_trailer(&mut self, file: &mut dyn Write) -> Result<()> {
-        self.trailer.set("Size", i64::from(self.max_id + 1));
+    fn write_trailer(&mut self, file: &mut dyn Write, size: u32) -> Result<()> {
+        self.trailer.set("Size", i64::from(size));
         file.write_all(b"trailer\n")?;
         Writer::write_dictionary(file, &self.trailer)?;
         Ok(())
@@ -426,12 +482,13 @@ impl IncrementalDocument {
             match xref.cross_reference_type {
                 XrefType::CrossReferenceTable => {
                     Writer::write_xref(&mut target, &xref)?;
-                    self.new_document.write_trailer(&mut target)?;
+                    self.new_document
+                        .write_trailer(&mut target, self.new_document.max_id + 1)?;
                 }
                 XrefType::CrossReferenceStream => {
                     // Cross Reference Stream instead of XRef and Trailer
                     self.new_document
-                        .write_cross_reference_stream(&mut target, &mut xref, xref_start as u32)?;
+                        .write_cross_reference_stream(&mut target, &mut xref, xref_start as u32, false)?;
                 }
             }
             // Write `startxref` part of trailer
@@ -476,8 +533,12 @@ impl Writer {
         writeln!(file, "xref")?;
 
         let mut xref_section = XrefSection::new(0);
-        // Add first (0) entry
-        xref_section.add_unusable_free_entry();
+        // Full rewrites supply object 0; sparse incremental callers retain the fallback.
+        if let Some(entry @ XrefEntry::Free { .. }) = xref.get(0) {
+            xref_section.add_entry(entry.clone());
+        } else {
+            xref_section.add_unusable_free_entry();
+        }
 
         // Iterate over the actual highest entry instead of `xref.size`:
         // `size` is fixed before object streams (and the xref stream itself)
@@ -523,6 +584,9 @@ impl Writer {
     fn create_xref_steam(xref: &Xref, filter: XRefStreamFilter) -> Result<(Vec<u8>, usize, Object)> {
         let mut xref_sections = Vec::new();
         let mut xref_section = XrefSection::new(0);
+        if let Some(entry @ XrefEntry::Free { .. }) = xref.get(0) {
+            xref_section.add_entry(entry.clone());
+        }
 
         // Iterate over the actual highest entry instead of `xref.size`:
         // `size` is fixed before object streams (and the xref stream itself)
