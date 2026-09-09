@@ -7,9 +7,10 @@
 
 #![cfg(not(feature = "async"))]
 
+use lopdf::xref::XrefType;
 use lopdf::{
-    Document, EncryptionState, EncryptionVersion, LoadOptions, Object, Permissions, SaveOptions, Stream, StringFormat,
-    dictionary,
+    Document, EncryptionState, EncryptionVersion, LoadOptions, Object, ObjectStreamConfig, Permissions, SaveOptions,
+    Stream, StringFormat, dictionary,
 };
 
 /// Build a one page document carrying a string we can check after a round trip.
@@ -182,4 +183,70 @@ fn save_modern_still_uses_object_streams_when_not_encrypted() {
         contains(&buffer, b"/ObjStm"),
         "an unencrypted document should still be packed into object streams"
     );
+}
+
+/// An encrypted document with a classic cross-reference table keeps both
+/// behaviours under `object_streams = true, xref_streams = false`: the object
+/// streams are skipped (the writer cannot encrypt one), and the classic table is
+/// preserved rather than being rejected for lacking compressed-entry authority.
+#[test]
+fn encrypted_classic_save_skips_object_streams_and_keeps_classic_table() {
+    let mut doc = sample_document();
+    doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+    encrypt_aes128(&mut doc);
+
+    let options = SaveOptions::builder()
+        .use_object_streams(true)
+        .use_xref_streams(false)
+        .build();
+    let mut buffer = Vec::new();
+    doc.save_with_options(&mut buffer, options).unwrap();
+
+    assert!(
+        !contains(&buffer, b"/ObjStm"),
+        "an encrypted document must not be packed into an object stream the writer cannot encrypt"
+    );
+    assert!(
+        contains(&buffer, b"\nxref\n"),
+        "the classic cross-reference table must be preserved for the encrypted fallback"
+    );
+    assert!(
+        !contains(&buffer, b"/Type/XRef") && !contains(&buffer, b"/Type /XRef"),
+        "no cross-reference stream was requested"
+    );
+
+    assert_round_trips(&buffer, "encrypted classic save with object streams requested");
+}
+
+/// Unused configuration is not validated: an encrypted document skips object
+/// streams entirely, so even a directly constructed zero capacity must not fail
+/// the save on the capacity alone.
+#[test]
+fn encrypted_save_ignores_zero_capacity_because_object_streams_are_skipped() {
+    let mut doc = sample_document();
+    doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+    encrypt_aes128(&mut doc);
+
+    let options = SaveOptions {
+        use_object_streams: true,
+        use_xref_streams: false,
+        object_stream_config: ObjectStreamConfig {
+            max_objects_per_stream: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut buffer = Vec::new();
+    doc.save_with_options(&mut buffer, options).unwrap();
+
+    assert!(
+        !contains(&buffer, b"/ObjStm"),
+        "object streams are skipped for encrypted documents regardless of capacity"
+    );
+    assert!(
+        contains(&buffer, b"\nxref\n"),
+        "the classic cross-reference table must be preserved for the encrypted fallback"
+    );
+
+    assert_round_trips(&buffer, "encrypted save with zero-capacity configuration");
 }

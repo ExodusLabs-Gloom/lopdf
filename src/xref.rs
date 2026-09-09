@@ -143,13 +143,21 @@ impl XrefEntry {
     }
 
     /// Write Entry in Cross Reference Table.
+    ///
+    /// A compressed entry has no classic-table representation: an object inside an
+    /// object stream can only be located through a type-2 cross-reference-stream
+    /// entry. Writing one here would present a live object as free, so it is
+    /// refused with [`std::io::ErrorKind::Unsupported`] instead.
     pub fn write_xref_entry(&self, file: &mut dyn Write) -> Result<()> {
         match self {
             XrefEntry::Normal { offset, generation } => {
                 writeln!(file, "{offset:>010} {generation:>05} n ")?;
             }
-            XrefEntry::Compressed { container: _, index: _ } => {
-                writeln!(file, "{:>010} {:>05} f ", 0, 65535)?;
+            XrefEntry::Compressed { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "a compressed cross-reference entry requires cross-reference stream authority",
+                ));
             }
             XrefEntry::Free { next_free, generation } => {
                 writeln!(file, "{next_free:>010} {generation:>05} f ")?;
@@ -183,8 +191,22 @@ impl XrefSection {
     }
 
     /// Write Section in Cross Reference Table.
+    ///
+    /// Refuses a section holding compressed entries with
+    /// [`std::io::ErrorKind::Unsupported`] before the section header is written:
+    /// a classic table cannot locate objects inside object streams.
     pub fn write_xref_section(&self, file: &mut dyn Write) -> Result<()> {
         if !self.is_empty() {
+            if self
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, XrefEntry::Compressed { .. }))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "a compressed cross-reference entry requires cross-reference stream authority",
+                ));
+            }
             // Write section range
             writeln!(file, "{} {}", self.starting_id, self.entries.len())?;
             // Write entries
@@ -344,5 +366,34 @@ fn bytes_needed(value: u64) -> usize {
         1
     } else {
         (64 - value.leading_zeros()).div_ceil(8) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compressed_entry_cannot_be_serialized_for_a_classic_table() {
+        let mut buffer = Vec::new();
+        let error = XrefEntry::Compressed { container: 7, index: 2 }
+            .write_xref_entry(&mut buffer)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            buffer.is_empty(),
+            "no free-entry bytes may be produced for a compressed entry"
+        );
+    }
+
+    #[test]
+    fn section_writing_propagates_the_compressed_entry_rejection() {
+        let mut section = XrefSection::new(2);
+        section.add_entry(XrefEntry::Compressed { container: 7, index: 2 });
+
+        let mut buffer = Vec::new();
+        let error = section.write_xref_section(&mut buffer).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(buffer.is_empty());
     }
 }

@@ -27,7 +27,56 @@ impl Document {
     ///
     /// Object streams are skipped for an encrypted document, which is written with every
     /// object serialized individually instead. See [`Document::save_modern`].
+    ///
+    /// Object streams need cross-reference authority able to encode type-2 compressed
+    /// entries, which lopdf provides through cross-reference streams. The hybrid-reference
+    /// file that could carry them next to a classic cross-reference table is not
+    /// implemented, so a save that would emit object streams while keeping a classic
+    /// cross-reference table fails with [`std::io::ErrorKind::Unsupported`] before any
+    /// byte is written and before the document is modified. A configuration that cannot
+    /// hold any object (zero `ObjectStreamConfig::max_objects_per_stream`) is rejected
+    /// with [`std::io::ErrorKind::InvalidInput`] whenever an object stream would actually
+    /// be built; the builder never produces it, but the configuration fields are public.
     pub fn save_with_options<W: Write>(&mut self, target: &mut W, options: crate::SaveOptions) -> Result<()> {
+        use crate::ObjectStream;
+
+        // Preflight, before the version, the reference table, the trailer, the objects or
+        // any output byte are touched. A live object packed into an object stream can only
+        // be located through a type-2 compressed cross-reference entry, which a classic
+        // table cannot carry. `use_xref_streams = false` preserves the document's current
+        // representation instead of forcing a classic table, so a document that already
+        // uses cross-reference streams keeps working with object streams enabled.
+        let selected_xref_type = if options.use_xref_streams {
+            XrefType::CrossReferenceStream
+        } else {
+            self.reference_table.cross_reference_type
+        };
+
+        let has_object_stream_candidates = options.use_object_streams
+            && !self.is_encrypted()
+            && self.objects.iter().any(|(&(id, generation), object)| {
+                generation == 0 && ObjectStream::can_be_compressed((id, generation), object, self)
+            });
+
+        if has_object_stream_candidates {
+            // Only configuration that would actually be used is validated here: an
+            // encrypted document skips object streams entirely, and with no eligible
+            // object no object stream is constructed, so capacity stays irrelevant.
+            if options.object_stream_config.max_objects_per_stream == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "object stream capacity must be greater than zero",
+                ));
+            }
+            if matches!(selected_xref_type, XrefType::CrossReferenceTable) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "object streams require cross-reference authority capable of type-2 compressed entries; \
+                     hybrid-reference output is not implemented",
+                ));
+            }
+        }
+
         // Cross-reference streams are independent of object streams: a document can use one
         // without the other. Select the requested type here so the choice applies whichever
         // path writes the body below. Both features arrived in PDF 1.5, so a document that is
@@ -170,9 +219,12 @@ impl Document {
                 }
 
                 let stream_index = object_streams.len() - 1;
+                // The object has already been pulled out of direct serialization, so a
+                // failed insertion would silently drop a live object from the file. The
+                // save must fail instead.
                 object_streams[stream_index]
                     .add_object((id, generation), object.clone())
-                    .ok();
+                    .map_err(std::io::Error::other)?;
                 object_to_stream_map.insert((id, generation), stream_index);
             } else {
                 // Object must be written directly
@@ -529,7 +581,24 @@ impl Writer {
     /// Write Cross Reference Table.
     ///
     /// Note: This is different from a "Cross Reference Stream".
+    ///
+    /// A classic table has no way to locate an object inside an object stream, so an
+    /// xref holding live compressed (type-2) entries is rejected with
+    /// [`std::io::ErrorKind::Unsupported`] before a single byte is written; turning
+    /// such an entry into a free one would present a live object as deleted.
     fn write_xref(file: &mut dyn Write, xref: &Xref) -> Result<()> {
+        if xref
+            .entries
+            .values()
+            .any(|entry| matches!(entry, XrefEntry::Compressed { .. }))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a classic cross-reference table cannot locate objects inside object streams; \
+                 compressed entries require cross-reference stream authority",
+            ));
+        }
+
         writeln!(file, "xref")?;
 
         let mut xref_section = XrefSection::new(0);
@@ -555,8 +624,14 @@ impl Writer {
                         // Add entry
                         xref_section.add_entry(XrefEntry::Normal { offset, generation });
                     }
-                    XrefEntry::Compressed { container: _, index: _ } => {
-                        xref_section.add_unusable_free_entry();
+                    XrefEntry::Compressed { .. } => {
+                        // Rejected above, before any byte was written. Kept as a guard so
+                        // a compressed entry can never decay into a free entry here.
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "a classic cross-reference table cannot locate objects inside object streams; \
+                             compressed entries require cross-reference stream authority",
+                        ));
                     }
                     XrefEntry::Free { next_free, generation } => {
                         xref_section.add_entry(XrefEntry::Free { next_free, generation });
@@ -895,4 +970,32 @@ fn save_document() {
     assert!(file_path.is_file());
     // Check if the file is above 400 bytes (should be about 610 bytes)
     assert!(file_path.metadata().unwrap().len() > 400);
+}
+
+#[test]
+fn write_xref_rejects_compressed_entries_before_emitting_bytes() {
+    let mut xref = Xref::new(4, XrefType::CrossReferenceTable);
+    xref.insert(
+        1,
+        XrefEntry::Normal {
+            offset: 9,
+            generation: 0,
+        },
+    );
+    xref.insert(2, XrefEntry::Compressed { container: 3, index: 1 });
+    xref.insert(
+        3,
+        XrefEntry::Normal {
+            offset: 42,
+            generation: 0,
+        },
+    );
+
+    let mut buffer = Vec::new();
+    let error = Writer::write_xref(&mut buffer, &xref).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(
+        buffer.is_empty(),
+        "a rejected table must not emit a single byte, not even the 'xref' keyword"
+    );
 }
