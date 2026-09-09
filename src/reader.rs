@@ -885,6 +885,7 @@ impl Reader<'_> {
             for (container_id, objects_in_stream) in streams_to_process {
                 if let Some(container_obj) = self.document.objects.get(&(container_id, 0))
                     && let Ok(stream) = container_obj.as_stream()
+                    && stream.dict.has_type(b"ObjStm")
                 {
                     match ObjectStream::parse_indexed_with_limit(stream, self.max_decompressed_size) {
                         Ok(object_stream) => {
@@ -1139,6 +1140,9 @@ impl Reader<'_> {
         let mut already_seen = HashSet::new();
         let container_obj = self.get_object(container_id, &mut already_seen)?;
         let container_stream = container_obj.as_stream()?;
+        if !container_stream.dict.has_type(b"ObjStm") {
+            return Err(Error::InvalidObjectStream("container must have /Type /ObjStm".into()));
+        }
         let object_stream = ObjectStream::parse_indexed_with_limit(container_stream, self.max_decompressed_size)?;
         object_stream
             .get(&usize::from(index))

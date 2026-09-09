@@ -148,3 +148,123 @@ fn deferred_decryption_requires_matching_compressed_authority() {
         assert_eq!(title, expected.map(str::as_bytes));
     }
 }
+
+fn set_container_type(doc: &mut Document, kind: Option<&str>) {
+    let stream = doc.objects.get_mut(&(8, 0)).unwrap().as_stream_mut().unwrap();
+    stream.dict.remove(b"Type");
+    if let Some(kind) = kind {
+        stream.dict.set("Type", Object::Name(kind.as_bytes().to_vec()));
+    }
+}
+
+fn encrypt_container(doc: &mut Document) {
+    use lopdf::{EncryptionState, EncryptionVersion, Permissions};
+    doc.objects.remove(&(5, 0));
+    doc.trailer.set(
+        "ID",
+        vec![
+            Object::string_literal("identifier"),
+            Object::string_literal("identifier"),
+        ],
+    );
+    let state = EncryptionState::try_from(EncryptionVersion::V2 {
+        document: doc,
+        owner_password: "owner",
+        user_password: "user",
+        key_length: 128,
+        permissions: Permissions::PRINTABLE,
+    })
+    .unwrap();
+    doc.encrypt(&state).unwrap();
+}
+
+#[test]
+fn container_type_controls_full_and_metadata_materialization() {
+    for kind in ["/Type /ObjStm", "", "/Type /Other"] {
+        let original = fixture(Some(XrefEntry::Compressed { container: 8, index: 0 }), false);
+        let mut bytes = original;
+        let marker = b"/Type /ObjStm";
+        let start = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+        let replacement = format!("{kind:width$}", width = marker.len());
+        bytes[start..start + marker.len()].copy_from_slice(replacement.as_bytes());
+        let expected = kind == "/Type /ObjStm";
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert_eq!(doc.get_object((5, 0)).is_ok(), expected, "{kind}");
+        assert!(doc.get_object((8, 0)).unwrap().as_stream().is_ok());
+        assert_eq!(
+            Document::load_metadata_mem(&bytes).unwrap().title.as_deref(),
+            expected.then_some("copy 8")
+        );
+    }
+}
+
+#[test]
+fn container_type_controls_encrypted_and_deferred_materialization() {
+    for kind in [Some("ObjStm"), None, Some("XObject")] {
+        for (container, index, member, expected) in
+            [(8, 0, 5, true), (7, 0, 5, false), (8, 1, 5, false), (8, 0, 6, false)]
+        {
+            let mut doc =
+                Document::load_mem(&fixture(Some(XrefEntry::Compressed { container, index }), false)).unwrap();
+            doc.objects.get_mut(&(8, 0)).unwrap().as_stream_mut().unwrap().content[0] = b'0' + member;
+            set_container_type(&mut doc, kind);
+            encrypt_container(&mut doc);
+            let expected = expected && kind == Some("ObjStm");
+            let mut deferred = doc.clone();
+            deferred.decrypt_raw(b"user").unwrap();
+            assert_eq!(deferred.get_object((5, 0)).is_ok(), expected);
+
+            // Save the physical container as a generic stream so the writer retains it.
+            set_container_type(&mut doc, Some("Unused"));
+            let encrypt_id = doc.trailer.get(b"Encrypt").unwrap().as_reference().unwrap();
+            let mut bytes = Vec::new();
+            doc.save_to(&mut bytes).unwrap();
+            let marker = b"/Type/Unused";
+            let start = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+            let replacement = match kind {
+                Some("ObjStm") => b"/Type/ObjStm".as_slice(),
+                None => b"            ".as_slice(),
+                _ => b"/Type/Other ".as_slice(),
+            };
+            bytes[start..start + marker.len()].copy_from_slice(replacement);
+            let tail = String::from_utf8_lossy(&bytes);
+            let prev: usize = tail
+                .rsplit("startxref\n")
+                .next()
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let start = bytes.len() + 1;
+            bytes.extend_from_slice(format!("\n20 0 obj\n<< /Type /XRef /Size 21 /Root 1 0 R /Info 5 0 R /Encrypt {} {} R /ID [(identifier)(identifier)] /Prev {prev} /W [1 4 2] /Index [5 1 20 1] /Length 14 >>\nstream\n", encrypt_id.0, encrypt_id.1).as_bytes());
+            bytes.push(2);
+            bytes.extend_from_slice(&container.to_be_bytes());
+            bytes.extend_from_slice(&index.to_be_bytes());
+            bytes.push(1);
+            bytes.extend_from_slice(&(start as u32).to_be_bytes());
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+            bytes.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{start}\n%%EOF\n").as_bytes());
+            let loaded = Document::load_mem_with_options(&bytes, LoadOptions::with_password("user")).unwrap();
+            assert!(!loaded.is_encrypted());
+            assert_eq!(
+                loaded.get_object((5, 0)).is_ok(),
+                expected,
+                "{kind:?}, {container}, {index}"
+            );
+            if expected {
+                assert_eq!(
+                    loaded
+                        .get_dictionary((5, 0))
+                        .unwrap()
+                        .get(b"Title")
+                        .unwrap()
+                        .as_str()
+                        .unwrap(),
+                    b"copy 8"
+                );
+            }
+        }
+    }
+}
