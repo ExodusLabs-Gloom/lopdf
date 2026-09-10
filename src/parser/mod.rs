@@ -505,6 +505,22 @@ fn _indirect_object<'a>(
     input: ParserInput<'a>, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
     already_seen: &mut HashSet<ObjectId>, recover_stream_length: bool, recovery_bound: Option<usize>,
 ) -> crate::Result<(ObjectId, Object)> {
+    indirect_object_with_remainder(
+        input,
+        offset,
+        expected_id,
+        reader,
+        already_seen,
+        recover_stream_length,
+        recovery_bound,
+    )
+    .map(|(_, value)| value)
+}
+
+fn indirect_object_with_remainder<'a>(
+    input: ParserInput<'a>, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
+    already_seen: &mut HashSet<ObjectId>, recover_stream_length: bool, recovery_bound: Option<usize>,
+) -> crate::Result<(ParserInput<'a>, (ObjectId, Object))> {
     let (i, (_, object_id)) = terminated((space, object_id), pair(tag(&b"obj"[..]), space))
         .parse(input)
         .map_err(|_| Error::IndirectObject { offset })?;
@@ -515,7 +531,7 @@ fn _indirect_object<'a>(
     }
 
     let object_offset = input.len() - i.len();
-    let (_, mut object) = terminated(
+    let (remaining, mut object) = terminated(
         |i: ParserInput<'a>| object(i, reader, already_seen, recover_stream_length, recovery_bound),
         (space, opt(tag(&b"endobj"[..])), space),
     )
@@ -524,7 +540,7 @@ fn _indirect_object<'a>(
 
     offset_stream(&mut object, object_offset);
 
-    Ok((object_id, object))
+    Ok((remaining, (object_id, object)))
 }
 
 pub fn header(input: ParserInput, strict: bool) -> Option<String> {
@@ -592,23 +608,26 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
 
     delimited(
         pair(tag(&b"xref"[..]), preceded(opt(tag(&b" "[..])), eol)),
-        fold_many1(
+        map_res(fold_many1(
             xref_section,
-            || -> Xref { Xref::new(0, XrefType::CrossReferenceTable) },
-            |mut xref, ((start, _count), entries)| {
+            || -> Result<Xref, ()> { Ok(Xref::new(0, XrefType::CrossReferenceTable)) },
+            |xref, ((start, _count), entries)| {
+                let mut xref = xref?;
                 let mut skipped = 0usize;
                 for (index, ((offset, generation), is_normal)) in entries.into_iter().enumerate() {
-                    if is_normal && let Ok(generation) = generation.try_into() {
-                        // `start` is read from the subsection header, so it is untrusted:
-                        // `start + index` can overflow, and object numbers are u32, so a
-                        // `start` above u32::MAX would truncate into a valid-looking number
-                        // that silently displaces a legitimate entry. Skip whatever cannot
-                        // be represented, as an out-of-range generation is skipped above.
-                        match start.checked_add(index).and_then(|id| u32::try_from(id).ok()) {
-                            Some(id) => xref.insert(id, XrefEntry::Normal { offset, generation }),
-                            None => skipped += 1,
-                        }
-                    }
+                    // Unsupported object numbers cannot claim a supported identity.
+                    let Some(id) = start.checked_add(index).and_then(|id| u32::try_from(id).ok()) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    // A supported identity must not disappear and expose an older revision.
+                    let generation = u16::try_from(generation).map_err(|_| ())?;
+                    let entry = if is_normal {
+                        XrefEntry::Normal { offset, generation }
+                    } else {
+                        XrefEntry::Free { next_free: offset, generation }
+                    };
+                    xref.insert(id, entry);
                 }
                 if skipped > 0 {
                     log::warn!(
@@ -616,9 +635,9 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
                         if skipped == 1 { "y" } else { "ies" }
                     );
                 }
-                xref
+                Ok(xref)
             },
-        ),
+        ), |xref| xref),
         space,
     )
     .parse(input)
@@ -629,6 +648,12 @@ fn trailer(input: ParserInput) -> NomResult<Dictionary> {
 }
 
 pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
+    xref_and_trailer_with_remainder(input, reader).map(|(_, value)| value)
+}
+
+pub(crate) fn xref_and_trailer_with_remainder<'a>(
+    input: ParserInput<'a>, reader: &Reader,
+) -> crate::Result<(ParserInput<'a>, (Xref, Dictionary))> {
     let xref_trailer = map(pair(|i| xref(i, reader.strict), trailer), |(mut xref, trailer)| {
         xref.size = trailer
             .get(b"Size")
@@ -636,16 +661,16 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
             .map_err(|_| error::ParseError::InvalidTrailer)? as u32;
         Ok((xref, trailer))
     });
-    alt((
+    let result = alt((
         xref_trailer,
         (|input| {
-            _indirect_object(input, 0, None, reader, &mut HashSet::new(), false, None)
-                .map(|(_, obj)| {
+            indirect_object_with_remainder(input, 0, None, reader, &mut HashSet::new(), false, None)
+                .map(|(remaining, (_, obj))| {
                     let res = match obj {
                         Object::Stream(stream) => decode_xref_stream_with_limit(stream, reader.max_decompressed_size),
                         _ => Err(crate::error::ParseError::InvalidXref.into()),
                     };
-                    (input, res)
+                    (remaining, res)
                 })
                 .map_err(|_| {
                     // artificial error kind is created to allow descriptive nom errors
@@ -654,8 +679,9 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
         }),
     ))
     .parse(input)
-    .map(|(_, o)| o)
-    .map_err(|_| error::ParseError::InvalidTrailer)?
+    .map_err(|_| error::ParseError::InvalidTrailer)?;
+    let (remaining, value) = result;
+    Ok((remaining, value?))
 }
 
 pub fn xref_start(input: ParserInput) -> Option<i64> {
@@ -970,9 +996,8 @@ startxref
 153804\x20
 %%EOF
 ";
-        match xref(test_span(input), false) {
-            Ok((_, re)) => assert_eq!(re.entries.len(), 15),
-            Err(err) => panic!("unexpected {:?}", err),
+        for strict in [false, true] {
+            assert!(xref(test_span(input), strict).is_err());
         }
     }
 
@@ -1099,7 +1124,7 @@ EI";
         // Some PDF generators emit "xref \n" with a trailing space.
         let input = b"xref \n0 3\n0000000000 65535 f \n0000000017 00000 n \n0000000081 00000 n \ntrailer\n<</Size 3/Root 1 0 R>>\nstartxref\n175\n%%EOF\n";
         match xref(test_span(input), false) {
-            Ok((_, re)) => assert_eq!(re.entries.len(), 2),
+            Ok((_, re)) => assert_eq!(re.entries.len(), 3),
             Err(err) => panic!("xref with trailing space should parse: {:?}", err),
         }
     }
@@ -1121,7 +1146,7 @@ EI";
             ),
         ] {
             match xref(test_span(input), false) {
-                Ok((_, re)) => assert_eq!(re.entries.len(), 2, "{name} should yield both normal entries"),
+                Ok((_, re)) => assert_eq!(re.entries.len(), 3, "{name} should yield free and normal entries"),
                 Err(err) => panic!("19-byte entries ({name}) should parse when lenient: {err:?}"),
             }
         }
@@ -1201,7 +1226,7 @@ EI";
         ] {
             for strict in [false, true] {
                 match xref(test_span(input), strict) {
-                    Ok((_, re)) => assert_eq!(re.entries.len(), 2, "{name} (strict={strict}) lost an entry"),
+                    Ok((_, re)) => assert_eq!(re.entries.len(), 3, "{name} (strict={strict}) lost an entry"),
                     Err(err) => panic!("conforming {name} entries should parse (strict={strict}): {err:?}"),
                 }
             }
@@ -1228,6 +1253,23 @@ EI";
     }
 
     #[test]
+    fn unsupported_object_number_with_generation_overflow_is_still_skipped() {
+        let input = b"xref\n4294967295 2\n0000000009 00001 n \n0000000000 99999 f \n0 1\n0000000000 65535 f \n";
+        for strict in [false, true] {
+            let (_, table) = xref(test_span(input), strict).unwrap();
+            assert_eq!(table.entries.len(), 2);
+            assert!(matches!(
+                table.get(u32::MAX),
+                Some(XrefEntry::Normal {
+                    offset: 9,
+                    generation: 1
+                })
+            ));
+            assert!(matches!(table.get(0), Some(XrefEntry::Free { generation: 65535, .. })));
+        }
+    }
+
+    #[test]
     fn xref_subsection_start_beyond_u32_does_not_displace_entries() {
         // Object numbers are u32, but the subsection start is parsed as usize and was cast
         // with `as u32`. A start above u32::MAX truncated into a valid-looking number --
@@ -1239,7 +1281,7 @@ EI";
                 Ok((_, re)) => {
                     assert_eq!(
                         re.entries.len(),
-                        1,
+                        2,
                         "(strict={strict}) unexpected entries: {:?}",
                         re.entries
                     );

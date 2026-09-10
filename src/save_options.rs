@@ -3,10 +3,32 @@ use crate::ObjectStreamConfig;
 /// Options for saving PDF documents
 #[derive(Debug, Clone, Default)]
 pub struct SaveOptions {
-    /// Enable object streams for compressing non-stream objects
+    /// Enable object streams for compressing non-stream objects.
+    ///
+    /// Object streams can only be emitted when the selected output cross-reference
+    /// representation can encode type-2 compressed entries, which lopdf supports
+    /// through cross-reference-stream output. The PDF specification also permits
+    /// hybrid-reference files that pair a classic cross-reference table with a
+    /// `/XRefStm`, but lopdf does not write hybrid-reference files: a full save that
+    /// would emit object streams while keeping a classic cross-reference table fails
+    /// with [`std::io::ErrorKind::Unsupported`] before anything is written or modified.
+    ///
+    /// Configuration is validated only when it would actually be used. If an object
+    /// stream would be built and `object_stream_config.max_objects_per_stream` is zero,
+    /// the save fails with [`std::io::ErrorKind::InvalidInput`]. The builder normalizes
+    /// a zero to the default capacity, so only direct construction of the configuration
+    /// struct can produce this. An encrypted document skips newly constructed object
+    /// streams; its objects are serialized individually and the selected cross-reference
+    /// type still applies, regardless of the capacity.
     pub use_object_streams: bool,
 
-    /// Enable cross-reference streams instead of traditional xref tables
+    /// Enable cross-reference streams instead of the document's current
+    /// cross-reference representation.
+    ///
+    /// `true` forces cross-reference-stream output. `false` preserves the
+    /// representation the document already uses; it does NOT force classic
+    /// cross-reference-table output, so a document loaded from a
+    /// cross-reference-stream file stays on cross-reference streams.
     pub use_xref_streams: bool,
 
     /// Enable linearization (fast web view)
@@ -35,12 +57,18 @@ pub struct SaveOptionsBuilder {
 
 impl SaveOptionsBuilder {
     /// Enable or disable object streams
+    ///
+    /// See [`SaveOptions::use_object_streams`] for the cross-reference representation
+    /// object streams require and the zero-capacity restriction.
     pub fn use_object_streams(mut self, value: bool) -> Self {
         self.use_object_streams = value;
         self
     }
 
     /// Enable or disable cross-reference streams
+    ///
+    /// `true` forces cross-reference-stream output; `false` keeps the document's
+    /// current cross-reference representation.
     pub fn use_xref_streams(mut self, value: bool) -> Self {
         self.use_xref_streams = value;
         self
@@ -53,6 +81,13 @@ impl SaveOptionsBuilder {
     }
 
     /// Set maximum objects per stream
+    ///
+    /// This is a requested maximum: generated streams may be split below it.
+    /// lopdf currently limits generated streams to 65,536 members so their type-2
+    /// member indices fit its `u16` representation; this is not a PDF format limit.
+    ///
+    /// A value of zero is normalized to the default capacity, so a configuration
+    /// produced by this builder always holds objects.
     pub fn max_objects_per_stream(mut self, value: usize) -> Self {
         self.max_objects_per_stream = value;
         self

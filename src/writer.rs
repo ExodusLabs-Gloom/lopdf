@@ -27,7 +27,56 @@ impl Document {
     ///
     /// Object streams are skipped for an encrypted document, which is written with every
     /// object serialized individually instead. See [`Document::save_modern`].
+    ///
+    /// Object streams need cross-reference authority able to encode type-2 compressed
+    /// entries, which lopdf provides through cross-reference streams. The hybrid-reference
+    /// file that could carry them next to a classic cross-reference table is not
+    /// implemented, so a save that would emit object streams while keeping a classic
+    /// cross-reference table fails with [`std::io::ErrorKind::Unsupported`] before any
+    /// byte is written and before the document is modified. A configuration that cannot
+    /// hold any object (zero `ObjectStreamConfig::max_objects_per_stream`) is rejected
+    /// with [`std::io::ErrorKind::InvalidInput`] whenever an object stream would actually
+    /// be built; the builder never produces it, but the configuration fields are public.
     pub fn save_with_options<W: Write>(&mut self, target: &mut W, options: crate::SaveOptions) -> Result<()> {
+        use crate::ObjectStream;
+
+        // Preflight, before the version, the reference table, the trailer, the objects or
+        // any output byte are touched. A live object packed into an object stream can only
+        // be located through a type-2 compressed cross-reference entry, which a classic
+        // table cannot carry. `use_xref_streams = false` preserves the document's current
+        // representation instead of forcing a classic table, so a document that already
+        // uses cross-reference streams keeps working with object streams enabled.
+        let selected_xref_type = if options.use_xref_streams {
+            XrefType::CrossReferenceStream
+        } else {
+            self.reference_table.cross_reference_type
+        };
+
+        let has_object_stream_candidates = options.use_object_streams
+            && !self.is_encrypted()
+            && self.objects.iter().any(|(&(id, generation), object)| {
+                generation == 0 && ObjectStream::can_be_compressed((id, generation), object, self)
+            });
+
+        if has_object_stream_candidates {
+            // Only configuration that would actually be used is validated here: an
+            // encrypted document skips object streams entirely, and with no eligible
+            // object no object stream is constructed, so capacity stays irrelevant.
+            if options.object_stream_config.max_objects_per_stream == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "object stream capacity must be greater than zero",
+                ));
+            }
+            if matches!(selected_xref_type, XrefType::CrossReferenceTable) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "object streams require cross-reference authority capable of type-2 compressed entries; \
+                     hybrid-reference output is not implemented",
+                ));
+            }
+        }
+
         // Cross-reference streams are independent of object streams: a document can use one
         // without the other. Select the requested type here so the choice applies whichever
         // path writes the body below. Both features arrived in PDF 1.5, so a document that is
@@ -90,12 +139,13 @@ impl Document {
         // Pick right cross reference stream.
         match xref.cross_reference_type {
             XrefType::CrossReferenceTable => {
+                self.normalize_full_save_xref(&mut xref);
                 Writer::write_xref(&mut target, &xref)?;
-                self.write_trailer(&mut target)?;
+                self.write_trailer(&mut target, xref.size)?;
             }
             XrefType::CrossReferenceStream => {
                 // Cross Reference Stream instead of XRef and Trailer
-                self.write_cross_reference_stream(&mut target, &mut xref, xref_start as u32)?;
+                self.write_cross_reference_stream(&mut target, &mut xref, true)?;
             }
         }
         // Write `startxref` part of trailer
@@ -136,6 +186,12 @@ impl Document {
         Writer::write_binary_mark(&mut target, &self.binary_mark)?;
 
         // Organize objects into streams
+        // Generated type-2 member indices must fit lopdf's u16 representation.
+        const MAX_GENERATED_OBJECT_STREAM_MEMBERS: usize = u16::MAX as usize + 1;
+        let effective_max = options
+            .object_stream_config
+            .max_objects_per_stream
+            .min(MAX_GENERATED_OBJECT_STREAM_MEMBERS);
         let mut object_streams: Vec<crate::ObjectStream> = Vec::new();
         let mut objects_to_write_directly = Vec::new();
         let mut object_to_stream_map = HashMap::new();
@@ -156,22 +212,22 @@ impl Document {
                 // Find or create an object stream for it
                 let stream_index = object_streams.len().saturating_sub(1);
 
-                if object_streams.is_empty()
-                    || object_streams[stream_index].object_count()
-                        >= options.object_stream_config.max_objects_per_stream
-                {
+                if object_streams.is_empty() || object_streams[stream_index].object_count() >= effective_max {
                     // Create new object stream
                     let new_stream = ObjectStream::builder()
-                        .max_objects(options.object_stream_config.max_objects_per_stream)
+                        .max_objects(effective_max)
                         .compression_level(options.object_stream_config.compression_level)
                         .build();
                     object_streams.push(new_stream);
                 }
 
                 let stream_index = object_streams.len() - 1;
+                // The object has already been pulled out of direct serialization, so a
+                // failed insertion would silently drop a live object from the file. The
+                // save must fail instead.
                 object_streams[stream_index]
                     .add_object((id, generation), object.clone())
-                    .ok();
+                    .map_err(std::io::Error::other)?;
                 object_to_stream_map.insert((id, generation), stream_index);
             } else {
                 // Object must be written directly
@@ -199,7 +255,7 @@ impl Document {
                     *obj_id,
                     XrefEntry::Compressed {
                         container: stream_id,
-                        index: index_in_stream as u16,
+                        index: u16::try_from(index_in_stream).map_err(std::io::Error::other)?,
                     },
                 );
             }
@@ -217,11 +273,12 @@ impl Document {
         // Write cross-reference
         match xref.cross_reference_type {
             XrefType::CrossReferenceTable => {
+                self.normalize_full_save_xref(&mut xref);
                 Writer::write_xref(&mut target, &xref)?;
-                self.write_trailer(&mut target)?;
+                self.write_trailer(&mut target, xref.size)?;
             }
             XrefType::CrossReferenceStream => {
-                self.write_cross_reference_stream(&mut target, &mut xref, xref_start as u32)?;
+                self.write_cross_reference_stream(&mut target, &mut xref, true)?;
             }
         }
 
@@ -229,13 +286,64 @@ impl Document {
         Ok(())
     }
 
+    /// Rebuild a full rewrite's free list from effective identities and generations.
+    fn normalize_full_save_xref(&self, xref: &mut Xref) {
+        // Preserve allocation state, emitted IDs, and explicit effective Free IDs.
+        // Neither the input trailer's Size nor reference_table.size is output capacity.
+        let highest_free = self
+            .reference_table
+            .entries
+            .iter()
+            .filter_map(|(&id, entry)| matches!(entry, XrefEntry::Free { .. } | XrefEntry::UnusableFree).then_some(id))
+            .max()
+            .unwrap_or(0);
+        let output_max = self.max_id.max(xref.max_id()).max(highest_free);
+        let mut next_free = 0;
+        // Walking backwards builds ascending links without trusting source pointers.
+        for id in (1..=output_max).rev() {
+            if matches!(
+                xref.get(id),
+                Some(XrefEntry::Normal { .. } | XrefEntry::Compressed { .. })
+            ) {
+                continue;
+            }
+            let generation = match self.reference_table.get(id) {
+                Some(XrefEntry::Free { generation, .. }) => *generation,
+                Some(XrefEntry::UnusableFree | XrefEntry::Null) => u16::MAX,
+                Some(XrefEntry::Normal { generation, .. }) => generation.saturating_add(1),
+                Some(XrefEntry::Compressed { .. }) => 1,
+                None => 0,
+            };
+            let reusable = generation < u16::MAX;
+            xref.insert(
+                id,
+                XrefEntry::Free {
+                    next_free: if reusable { next_free } else { 0 },
+                    generation,
+                },
+            );
+            if reusable {
+                next_free = id;
+            }
+        }
+        xref.insert(
+            0,
+            XrefEntry::Free {
+                next_free,
+                generation: u16::MAX,
+            },
+        );
+        xref.size = output_max + 1;
+    }
+
     /// Write the Cross Reference Stream.
     ///
     /// Insert an `Object` to the end of the PDF (not visible when inspecting `Document`).
     /// Note: This is different from the "Cross Reference Table".
     fn write_cross_reference_stream<W: Write>(
-        &mut self, file: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: u32,
+        &mut self, file: &mut CountingWrite<&mut W>, xref: &mut Xref, full_save: bool,
     ) -> Result<()> {
+        let xref_start = file.checked_position_u32()?;
         // Increment max_id to account for CRS.
         self.max_id += 1;
         let new_obj_id_for_crs = self.max_id;
@@ -246,9 +354,13 @@ impl Document {
                 generation: 0,
             },
         );
+        if full_save {
+            self.normalize_full_save_xref(xref);
+        }
         self.trailer.set("Type", Name(b"XRef".to_vec()));
         // Update `max_id` in trailer
-        self.trailer.set("Size", i64::from(self.max_id + 1));
+        self.trailer
+            .set("Size", i64::from(if full_save { xref.size } else { self.max_id + 1 }));
         // Set the size of each entry in bytes (default for PDFs is `[1 2 1]`)
         // In our case we use `[u8, u32, u16]` for each entry
         // to keep things simple and working at all times.
@@ -281,8 +393,8 @@ impl Document {
         Ok(())
     }
 
-    fn write_trailer(&mut self, file: &mut dyn Write) -> Result<()> {
-        self.trailer.set("Size", i64::from(self.max_id + 1));
+    fn write_trailer(&mut self, file: &mut dyn Write, size: u32) -> Result<()> {
+        self.trailer.set("Size", i64::from(size));
         file.write_all(b"trailer\n")?;
         Writer::write_dictionary(file, &self.trailer)?;
         Ok(())
@@ -354,8 +466,7 @@ impl IncrementalDocument {
 
         // Write previous document versions.
         let prev_document_bytes = self.get_prev_documents_bytes();
-        target.inner.write_all(prev_document_bytes)?;
-        target.bytes_written += prev_document_bytes.len();
+        target.write_all(prev_document_bytes)?;
 
         // Write/Append new document version.
         let mut xref = Xref::new(
@@ -426,12 +537,13 @@ impl IncrementalDocument {
             match xref.cross_reference_type {
                 XrefType::CrossReferenceTable => {
                     Writer::write_xref(&mut target, &xref)?;
-                    self.new_document.write_trailer(&mut target)?;
+                    self.new_document
+                        .write_trailer(&mut target, self.new_document.max_id + 1)?;
                 }
                 XrefType::CrossReferenceStream => {
                     // Cross Reference Stream instead of XRef and Trailer
                     self.new_document
-                        .write_cross_reference_stream(&mut target, &mut xref, xref_start as u32)?;
+                        .write_cross_reference_stream(&mut target, &mut xref, false)?;
                 }
             }
             // Write `startxref` part of trailer
@@ -472,12 +584,36 @@ impl Writer {
     /// Write Cross Reference Table.
     ///
     /// Note: This is different from a "Cross Reference Stream".
+    ///
+    /// A classic table has no way to locate an object inside an object stream, so an
+    /// xref holding live compressed (type-2) entries is rejected with
+    /// [`std::io::ErrorKind::Unsupported`] before a single byte is written; turning
+    /// such an entry into a free one would present a live object as deleted.
     fn write_xref(file: &mut dyn Write, xref: &Xref) -> Result<()> {
+        if xref.entries.values().any(|entry| matches!(entry, XrefEntry::Null)) {
+            return Err(crate::xref::null_serialization_error());
+        }
+        if xref
+            .entries
+            .values()
+            .any(|entry| matches!(entry, XrefEntry::Compressed { .. }))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a classic cross-reference table cannot locate objects inside object streams; \
+                 compressed entries require cross-reference stream authority",
+            ));
+        }
+
         writeln!(file, "xref")?;
 
         let mut xref_section = XrefSection::new(0);
-        // Add first (0) entry
-        xref_section.add_unusable_free_entry();
+        // Full rewrites supply object 0; sparse incremental callers retain the fallback.
+        if let Some(entry @ XrefEntry::Free { .. }) = xref.get(0) {
+            xref_section.add_entry(entry.clone());
+        } else {
+            xref_section.add_unusable_free_entry();
+        }
 
         // Iterate over the actual highest entry instead of `xref.size`:
         // `size` is fixed before object streams (and the xref stream itself)
@@ -490,15 +626,22 @@ impl Writer {
                     xref_section = XrefSection::new(obj_id);
                 }
                 match *entry {
+                    XrefEntry::Null => return Err(crate::xref::null_serialization_error()),
                     XrefEntry::Normal { offset, generation } => {
                         // Add entry
                         xref_section.add_entry(XrefEntry::Normal { offset, generation });
                     }
-                    XrefEntry::Compressed { container: _, index: _ } => {
-                        xref_section.add_unusable_free_entry();
+                    XrefEntry::Compressed { .. } => {
+                        // Rejected above, before any byte was written. Kept as a guard so
+                        // a compressed entry can never decay into a free entry here.
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "a classic cross-reference table cannot locate objects inside object streams; \
+                             compressed entries require cross-reference stream authority",
+                        ));
                     }
-                    XrefEntry::Free => {
-                        xref_section.add_entry(XrefEntry::Free);
+                    XrefEntry::Free { next_free, generation } => {
+                        xref_section.add_entry(XrefEntry::Free { next_free, generation });
                     }
                     XrefEntry::UnusableFree => {
                         xref_section.add_unusable_free_entry();
@@ -521,8 +664,14 @@ impl Writer {
 
     /// Create stream for Cross reference stream.
     fn create_xref_steam(xref: &Xref, filter: XRefStreamFilter) -> Result<(Vec<u8>, usize, Object)> {
+        if xref.entries.values().any(|entry| matches!(entry, XrefEntry::Null)) {
+            return Err(crate::xref::null_serialization_error());
+        }
         let mut xref_sections = Vec::new();
         let mut xref_section = XrefSection::new(0);
+        if let Some(entry @ XrefEntry::Free { .. }) = xref.get(0) {
+            xref_section.add_entry(entry.clone());
+        }
 
         // Iterate over the actual highest entry instead of `xref.size`:
         // `size` is fixed before object streams (and the xref stream itself)
@@ -558,11 +707,12 @@ impl Writer {
             // Add entries to stream
             for (obj_id, entry) in (section.starting_id..).zip(section.entries) {
                 match entry {
-                    XrefEntry::Free => {
+                    XrefEntry::Null => return Err(crate::xref::null_serialization_error()),
+                    XrefEntry::Free { next_free, generation } => {
                         // Type 0
                         xref_stream.push(0);
-                        xref_stream.extend(obj_id.to_be_bytes());
-                        xref_stream.extend(vec![0, 0]); // TODO add generation number
+                        xref_stream.extend(next_free.to_be_bytes());
+                        xref_stream.extend(generation.to_be_bytes());
                     }
                     XrefEntry::UnusableFree => {
                         // Type 0
@@ -602,7 +752,7 @@ impl Writer {
     fn write_indirect_object<W: Write>(
         file: &mut CountingWrite<&mut W>, id: u32, generation: u16, object: &Object, xref: &mut Xref,
     ) -> Result<()> {
-        let offset = file.bytes_written as u32;
+        let offset = file.checked_position_u32()?;
         xref.insert(id, XrefEntry::Normal { offset, generation });
         write!(
             file,
@@ -771,22 +921,46 @@ pub struct CountingWrite<W: Write> {
     bytes_written: usize,
 }
 
+impl<W: Write> CountingWrite<W> {
+    fn checked_position_u32(&self) -> Result<u32> {
+        u32::try_from(self.bytes_written).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PDF object offset exceeds the supported u32 range",
+            )
+        })
+    }
+}
+
 impl<W: Write> Write for CountingWrite<W> {
     #[inline]
     fn write(&mut self, buffer: &[u8]) -> Result<usize> {
         let result = self.inner.write(buffer);
         if let Ok(bytes) = result {
-            self.bytes_written += bytes;
+            match self.bytes_written.checked_add(bytes) {
+                Some(total) => self.bytes_written = total,
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "PDF output byte count exceeds the supported range",
+                    ));
+                }
+            }
         }
         result
     }
 
     #[inline]
     fn write_all(&mut self, buffer: &[u8]) -> Result<()> {
-        self.bytes_written += buffer.len();
-        // If this returns `Err` we can’t know how many bytes were actually written (if any)
-        // but that doesn’t matter since we’re gonna abort the entire PDF generation anyway.
-        self.inner.write_all(buffer)
+        let total = self.bytes_written.checked_add(buffer.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PDF output byte count exceeds the supported range",
+            )
+        })?;
+        self.inner.write_all(buffer)?;
+        self.bytes_written = total;
+        Ok(())
     }
 
     #[inline]
@@ -831,4 +1005,404 @@ fn save_document() {
     assert!(file_path.is_file());
     // Check if the file is above 400 bytes (should be about 610 bytes)
     assert!(file_path.metadata().unwrap().len() > 400);
+}
+
+#[test]
+fn raw_null_authority_is_rejected_by_both_writers() {
+    for id in [0, 2] {
+        let mut xref = Xref::new(3, XrefType::CrossReferenceStream);
+        xref.insert(
+            1,
+            XrefEntry::Normal {
+                offset: 9,
+                generation: 0,
+            },
+        );
+        xref.insert(id, XrefEntry::Null);
+        let mut bytes = Vec::new();
+        assert_eq!(
+            Writer::write_xref(&mut bytes, &xref).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(bytes.is_empty());
+        assert_eq!(
+            Writer::create_xref_steam(&xref, XRefStreamFilter::None)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
+}
+
+#[test]
+fn write_xref_rejects_compressed_entries_before_emitting_bytes() {
+    let mut xref = Xref::new(4, XrefType::CrossReferenceTable);
+    xref.insert(
+        1,
+        XrefEntry::Normal {
+            offset: 9,
+            generation: 0,
+        },
+    );
+    xref.insert(2, XrefEntry::Compressed { container: 3, index: 1 });
+    xref.insert(
+        3,
+        XrefEntry::Normal {
+            offset: 42,
+            generation: 0,
+        },
+    );
+
+    let mut buffer = Vec::new();
+    let error = Writer::write_xref(&mut buffer, &xref).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(
+        buffer.is_empty(),
+        "a rejected table must not emit a single byte, not even the 'xref' keyword"
+    );
+}
+
+#[cfg(test)]
+fn assert_normal_offset(entry: Option<&XrefEntry>, expected: u32) {
+    match entry {
+        Some(XrefEntry::Normal { offset, generation: 0 }) => assert_eq!(*offset, expected),
+        other => panic!("unexpected xref entry: {other:?}"),
+    }
+}
+
+#[test]
+fn checked_position_u32_accepts_u32_max() {
+    let mut sink = Vec::new();
+    let file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize,
+    };
+    assert_eq!(file.checked_position_u32().unwrap(), u32::MAX);
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn checked_position_u32_rejects_above_u32_max() {
+    let mut sink = Vec::new();
+    let file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize + 1,
+    };
+    let error = file.checked_position_u32().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn write_indirect_object_accepts_u32_max_offset() {
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize,
+    };
+    let mut xref = Xref::new(2, XrefType::CrossReferenceTable);
+    Writer::write_indirect_object(&mut file, 1, 0, &Object::Integer(7), &mut xref).unwrap();
+    assert_normal_offset(xref.get(1), u32::MAX);
+    let text = std::str::from_utf8(&sink).unwrap();
+    assert!(text.contains("1 0 obj"), "object bytes must reach the sink");
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn write_indirect_object_rejects_unrepresentable_offset() {
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize + 1,
+    };
+    let mut xref = Xref::new(2, XrefType::CrossReferenceTable);
+    let error = Writer::write_indirect_object(&mut file, 1, 0, &Object::Integer(7), &mut xref).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(xref.get(1).is_none(), "no xref authority may be inserted");
+    assert!(sink.is_empty(), "no object bytes may be emitted");
+}
+
+#[test]
+fn classic_table_serializes_u32_max_offset() {
+    let mut xref = Xref::new(2, XrefType::CrossReferenceTable);
+    xref.insert(
+        1,
+        XrefEntry::Normal {
+            offset: u32::MAX,
+            generation: 0,
+        },
+    );
+    let mut buffer = Vec::new();
+    Writer::write_xref(&mut buffer, &xref).unwrap();
+    let text = std::string::String::from_utf8(buffer).unwrap();
+    assert!(text.starts_with("xref\n"));
+    assert!(text.contains("0000000000 65535 f \n"));
+    assert!(text.contains("4294967295 00000 n \n"));
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn classic_footer_startxref_is_not_u32_constrained() {
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize + 1,
+    };
+    let mut xref = Xref::new(2, XrefType::CrossReferenceTable);
+    xref.insert(
+        1,
+        XrefEntry::Normal {
+            offset: 9,
+            generation: 0,
+        },
+    );
+    Writer::write_xref(&mut file, &xref).unwrap();
+    let xref_start = file.bytes_written;
+    assert!(xref_start as u64 > u64::from(u32::MAX));
+    write!(file, "\nstartxref\n{xref_start}\n%%EOF").unwrap();
+    let text = std::string::String::from_utf8(sink).unwrap();
+    assert!(text.contains(&format!("startxref\n{xref_start}\n%%EOF")));
+}
+
+#[test]
+fn xref_stream_self_offset_at_u32_max() {
+    let mut doc = Document::with_version("1.5");
+    doc.max_id = 1;
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize,
+    };
+    let mut xref = Xref::new(2, XrefType::CrossReferenceStream);
+    doc.write_cross_reference_stream(&mut file, &mut xref, true).unwrap();
+    assert_normal_offset(xref.get(doc.max_id), u32::MAX);
+    let type1_u32_max: [u8; 7] = [1, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00];
+    assert!(
+        sink.windows(type1_u32_max.len()).any(|window| window == type1_u32_max),
+        "raw type-1 field 2 must encode offset FF FF FF FF"
+    );
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn xref_stream_self_offset_above_u32_max_rejected_before_mutation() {
+    let mut doc = Document::with_version("1.5");
+    doc.max_id = 1;
+    doc.trailer.set("Root", Reference((1, 0)));
+    let trailer_before = doc.trailer.clone();
+    let max_id_before = doc.max_id;
+    let mut xref = Xref::new(2, XrefType::CrossReferenceStream);
+    xref.insert(
+        1,
+        XrefEntry::Normal {
+            offset: 9,
+            generation: 0,
+        },
+    );
+    let xref_entries_before = xref.entries.clone();
+
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize + 1,
+    };
+    let error = doc
+        .write_cross_reference_stream(&mut file, &mut xref, true)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(sink.is_empty(), "the helper must not emit any byte");
+    assert_eq!(doc.max_id, max_id_before, "max_id must stay untouched");
+    assert_eq!(doc.trailer, trailer_before, "trailer must stay untouched");
+    assert_eq!(
+        format!("{xref_entries_before:?}"),
+        format!("{:?}", xref.entries),
+        "xref entries must stay untouched"
+    );
+}
+
+#[test]
+fn full_save_footer_matches_xref_stream_position() {
+    let mut doc = Document::with_version("1.5");
+    doc.objects.insert((1, 0), Object::Integer(1));
+    doc.objects.insert((2, 0), Object::Integer(2));
+    doc.max_id = 2;
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    let text = std::string::String::from_utf8_lossy(&out);
+    let footer_pos = text.find("startxref\n").unwrap() + "startxref\n".len();
+    let footer_end = text[footer_pos..].find('\n').unwrap() + footer_pos;
+    let startxref: usize = text[footer_pos..footer_end].parse().unwrap();
+    let expected = format!("{} 0 obj", doc.max_id);
+    assert!(
+        out[startxref..].starts_with(expected.as_bytes()),
+        "the checked helper position and the printed startxref must both land on the xref stream object"
+    );
+}
+
+#[test]
+fn incremental_mode_xref_stream_uses_helper_position_and_full_width_footer() {
+    let mut doc = Document::with_version("1.5");
+    doc.max_id = 1;
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize,
+    };
+    let mut xref = Xref::new(2, XrefType::CrossReferenceStream);
+    let xref_start = file.bytes_written;
+    doc.write_cross_reference_stream(&mut file, &mut xref, false).unwrap();
+    assert_normal_offset(xref.get(doc.max_id), u32::MAX);
+    assert_eq!(
+        doc.trailer.get(b"Size").unwrap(),
+        &Object::Integer(i64::from(doc.max_id + 1))
+    );
+    write!(file, "\nstartxref\n{xref_start}\n%%EOF").unwrap();
+    let text = std::string::String::from_utf8_lossy(&sink);
+    assert!(text.contains("startxref\n4294967295\n%%EOF"));
+}
+
+#[test]
+fn generated_stream_object_accepts_u32_max_offset() {
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize,
+    };
+    let mut xref = Xref::new(6, XrefType::CrossReferenceStream);
+    let stream = Object::Stream(Stream::new(Dictionary::new(), vec![0x41, 0x42, 0x43]));
+    Writer::write_indirect_object(&mut file, 5, 0, &stream, &mut xref).unwrap();
+    assert_normal_offset(xref.get(5), u32::MAX);
+    let text = std::str::from_utf8(&sink).unwrap();
+    assert!(text.contains("5 0 obj"));
+    assert!(sink.windows(3).any(|window| window == [0x41, 0x42, 0x43]));
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn generated_stream_object_rejects_unrepresentable_offset() {
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: u32::MAX as usize + 1,
+    };
+    let mut xref = Xref::new(6, XrefType::CrossReferenceStream);
+    let stream = Object::Stream(Stream::new(Dictionary::new(), vec![0x41, 0x42, 0x43]));
+    let error = Writer::write_indirect_object(&mut file, 5, 0, &stream, &mut xref).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(xref.get(5).is_none());
+    assert!(sink.is_empty());
+}
+
+#[test]
+fn counting_write_write_overflow_returns_error_without_wrap() {
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: usize::MAX,
+    };
+    let error = file.write(b"payload").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(file.bytes_written, usize::MAX, "the counter must not wrap");
+    assert_eq!(sink, b"payload", "bytes already reached the sink, no rollback");
+}
+
+#[test]
+fn counting_write_zero_len_write_at_counter_max_is_ok() {
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: usize::MAX,
+    };
+    assert_eq!(file.write(b"").unwrap(), 0);
+    assert_eq!(file.bytes_written, usize::MAX);
+    assert!(sink.is_empty());
+}
+
+#[test]
+fn counting_write_counts_actually_written_bytes() {
+    struct OneByteAtATime(Vec<u8>);
+    impl Write for OneByteAtATime {
+        fn write(&mut self, buf: &[u8]) -> Result<usize> {
+            let accepted = buf.len().min(1);
+            self.0.extend_from_slice(&buf[..accepted]);
+            Ok(accepted)
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = OneByteAtATime(Vec::new());
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: 0,
+    };
+    assert_eq!(file.write(b"abc").unwrap(), 1);
+    assert_eq!(file.bytes_written, 1);
+    assert_eq!(sink.0, b"a");
+}
+
+#[test]
+fn counting_write_underlying_error_propagates() {
+    struct FailingSink;
+    impl Write for FailingSink {
+        fn write(&mut self, _: &[u8]) -> Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sink failed"))
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    let mut file = CountingWrite {
+        inner: FailingSink,
+        bytes_written: 10,
+    };
+    let error = file.write(b"abc").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(file.bytes_written, 10);
+}
+
+#[test]
+fn counting_write_all_overflow_is_rejected_before_the_underlying_write() {
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: usize::MAX,
+    };
+    let error = file.write_all(b"payload").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        sink.is_empty(),
+        "an unrepresentable future count must not reach the sink"
+    );
+}
+
+#[test]
+fn counting_write_all_advances_only_after_successful_write() {
+    let mut sink = Vec::new();
+    let mut file = CountingWrite {
+        inner: &mut sink,
+        bytes_written: usize::MAX - 3,
+    };
+    file.write_all(b"abc").unwrap();
+    assert_eq!(file.bytes_written, usize::MAX);
+    assert_eq!(sink, b"abc");
+}
+
+#[test]
+fn counting_write_all_underlying_error_does_not_advance_counter() {
+    struct FailingSink;
+    impl Write for FailingSink {
+        fn write(&mut self, _: &[u8]) -> Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sink failed"))
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    let mut file = CountingWrite {
+        inner: FailingSink,
+        bytes_written: 10,
+    };
+    let error = file.write_all(b"abc").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(file.bytes_written, 10);
 }

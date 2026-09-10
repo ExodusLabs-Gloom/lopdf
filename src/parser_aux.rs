@@ -548,12 +548,9 @@ pub fn decode_xref_stream_with_limit(
         .get(b"Size")
         .and_then(Object::as_i64)
         .map_err(|_| ParseError::InvalidXref)?;
-    let mut xref = Xref::new(size as u32, XrefType::CrossReferenceStream);
-    {
-        let section_indice = dict
-            .get(b"Index")
-            .and_then(parse_integer_array)
-            .unwrap_or_else(|_| vec![0, size]);
+    let size = u32::try_from(size).map_err(|_| ParseError::InvalidXref)?;
+    let (ranges, index_entries) = validated_xref_index(&dict, size)?;
+    let xref = {
         let field_widths = dict
             .get(b"W")
             .and_then(parse_integer_array)
@@ -583,14 +580,6 @@ pub fn decode_xref_stream_with_limit(
             return Err(ParseError::InvalidXref.into());
         }
 
-        let index_entries = section_indice
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .try_fold(0_usize, |total, section| {
-                let count = usize::try_from(section[1]).map_err(|_| ParseError::InvalidXref)?;
-                total.checked_add(count).ok_or(ParseError::InvalidXref)
-            })?;
         // An entry can't be read from bytes that aren't there. Validate the total before inserting
         // anything so multiple individually plausible /Index sections cannot overrun the body.
         //
@@ -605,57 +594,99 @@ pub fn decode_xref_stream_with_limit(
         let mut bytes1 = vec![0_u8; field_widths[0] as usize];
         let mut bytes2 = vec![0_u8; field_widths[1] as usize];
         let mut bytes3 = vec![0_u8; field_widths[2] as usize];
+        let mut xref = Xref::new(size, XrefType::CrossReferenceStream);
 
-        for section in section_indice.as_chunks::<2>().0 {
-            let start = section[0];
-            let count = section[1];
-
-            for j in 0..count {
+        for range in ranges {
+            for object_number in range {
                 let entry_type = if !bytes1.is_empty() {
                     read_big_endian_integer(&mut reader, bytes1.as_mut_slice())?
                 } else {
                     1
                 };
+                // Consume a whole record even for an unknown entry type. Decode
+                // before narrowing so high bytes cannot alias a valid identity.
+                let field2 = read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
+                let field3 = read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
                 match entry_type {
                     0 => {
-                        // free object
-                        read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
+                        // Free entries shadow older live objects just like normal entries.
+                        let next_free = u32::try_from(field2).map_err(|_| ParseError::InvalidXref)?;
+                        let generation = u16::try_from(field3).map_err(|_| ParseError::InvalidXref)?;
+                        xref.insert(object_number, XrefEntry::Free { next_free, generation });
                     }
                     1 => {
                         // normal object
-                        let offset = read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        let generation = if !bytes3.is_empty() {
-                            read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?
-                        } else {
-                            0
-                        } as u16;
-                        xref.insert((start + j) as u32, XrefEntry::Normal { offset, generation });
+                        let offset = u32::try_from(field2).map_err(|_| ParseError::InvalidXref)?;
+                        let generation = u16::try_from(field3).map_err(|_| ParseError::InvalidXref)?;
+                        xref.insert(object_number, XrefEntry::Normal { offset, generation });
                     }
                     2 => {
                         // compressed object
-                        let container = read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        let index = read_big_endian_integer(&mut reader, bytes3.as_mut_slice())? as u16;
-                        xref.insert((start + j) as u32, XrefEntry::Compressed { container, index });
+                        let container = u32::try_from(field2).map_err(|_| ParseError::InvalidXref)?;
+                        let index = u16::try_from(field3).map_err(|_| ParseError::InvalidXref)?;
+                        xref.insert(object_number, XrefEntry::Compressed { container, index });
                     }
-                    _ => {}
+                    _ => {
+                        xref.insert(object_number, XrefEntry::Null);
+                    }
                 }
             }
         }
-    }
+        xref
+    };
     dict.remove(b"Length");
     dict.remove(b"W");
     dict.remove(b"Index");
     Ok((xref, dict))
 }
 
-fn read_big_endian_integer(reader: &mut Cursor<Vec<u8>>, buffer: &mut [u8]) -> Result<u32> {
+// /W fields are bounded to eight bytes above; an omitted field decodes as zero.
+fn read_big_endian_integer(reader: &mut Cursor<Vec<u8>>, buffer: &mut [u8]) -> Result<u64> {
     reader.read_exact(buffer)?;
-    let mut value = 0;
-    for &mut byte in buffer {
-        value = (value << 8) + u32::from(byte);
+    buffer.iter().try_fold(0u64, |value, &byte| {
+        value
+            .checked_mul(256)
+            .and_then(|v| v.checked_add(u64::from(byte)))
+            .ok_or_else(|| ParseError::InvalidXref.into())
+    })
+}
+
+// Validate all subsection identities before any entry can acquire authority.
+fn validated_xref_index(dict: &Dictionary, size: u32) -> Result<(Vec<std::ops::Range<u32>>, usize)> {
+    let values = if dict.has(b"Index") {
+        dict.get(b"Index")
+            .and_then(parse_integer_array)
+            .map_err(|_| ParseError::InvalidXref)?
+    } else {
+        vec![0, i64::from(size)]
+    };
+    let (pairs, remainder) = values.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(ParseError::InvalidXref.into());
     }
-    Ok(value)
+    let mut ranges = Vec::with_capacity(pairs.len());
+    let mut total = 0usize;
+    let mut previous_start = 0;
+    let mut represented_end = 0;
+    for &[start, count] in pairs {
+        let end = start.checked_add(count).ok_or(ParseError::InvalidXref)?;
+        if start < 0 || count < 0 || end > i64::from(size) || start < previous_start {
+            return Err(ParseError::InvalidXref.into());
+        }
+        if count > 0 {
+            if start < represented_end {
+                return Err(ParseError::InvalidXref.into());
+            }
+            represented_end = end;
+        }
+        previous_start = start;
+        let start = u32::try_from(start).map_err(|_| ParseError::InvalidXref)?;
+        let end = u32::try_from(end).map_err(|_| ParseError::InvalidXref)?;
+        let count = usize::try_from(count).map_err(|_| ParseError::InvalidXref)?;
+        total = total.checked_add(count).ok_or(ParseError::InvalidXref)?;
+        ranges.push(start..end);
+    }
+    Ok((ranges, total))
 }
 
 fn parse_integer_array(array: &Object) -> Result<Vec<i64>> {

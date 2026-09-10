@@ -493,12 +493,6 @@ pub const MAX_BRACKET: usize = 100;
 
 pub const MAX_NESTING_DEPTH: usize = 100;
 
-/// Cap on reconstructed cross-reference entries, bounding memory on hostile inputs.
-const MAX_RECONSTRUCTED_OBJECTS: usize = 1_000_000;
-
-/// Cap on how many trailing `trailer` dictionaries are inspected for a `/Root`.
-const MAX_TRAILER_CANDIDATES: usize = 16;
-
 /// PDF metadata extracted without loading the entire document.
 /// This is useful for quickly getting basic information about large PDFs.
 #[derive(Debug, Clone)]
@@ -593,16 +587,7 @@ impl Reader<'_> {
 
         let version = parser::header(self.buffer, self.strict).ok_or(ParseError::InvalidFileHeader)?;
 
-        let (xref, trailer) = match self.resolve_xref_and_trailer() {
-            Ok(resolved) => resolved,
-            Err(err) => match self.reconstruct_xref_and_trailer() {
-                Some(reconstructed) => {
-                    warn!("cross-reference resolution failed ({err}); recovered by scanning for indirect objects");
-                    reconstructed
-                }
-                None => return Err(err),
-            },
-        };
+        let (xref, trailer) = self.resolve_authoritative_xref_and_trailer(&version)?;
 
         self.set_reference_table(xref);
         self.document.trailer = trailer.clone();
@@ -796,20 +781,11 @@ impl Reader<'_> {
             self.document.binary_mark = binary_mark;
         }
 
-        // Fall back to reconstruction only after all standard resolution fails.
-        let (xref, trailer) = match self.resolve_xref_and_trailer() {
-            Ok(resolved) => resolved,
-            Err(err) => match self.reconstruct_xref_and_trailer() {
-                Some(reconstructed) => {
-                    warn!("cross-reference resolution failed ({err}); recovered by scanning for indirect objects");
-                    reconstructed
-                }
-                None => return Err(err),
-            },
-        };
+        let (xref, trailer) = self.resolve_authoritative_xref_and_trailer(&version)?;
 
         self.document.version = version;
-        self.document.max_id = xref.size - 1;
+        // Trailer capacity does not reserve object numbers for allocation.
+        self.document.max_id = xref.max_id();
         self.document.trailer = trailer;
         self.set_reference_table(xref);
 
@@ -825,7 +801,7 @@ impl Reader<'_> {
         }
 
         // Object-stream members join `objects` only during loading, after
-        // `max_id` was derived from the xref size. Keep the ceiling at least
+        // `max_id` was derived from the effective xref entries. Keep the ceiling at least
         // at the highest loaded object so new ids cannot collide with live ones.
         if let Some(&max_loaded_id) = self.document.objects.keys().next_back() {
             self.document.max_id = self.document.max_id.max(max_loaded_id.0);
@@ -848,17 +824,25 @@ impl Reader<'_> {
 
         for (obj_num, entry) in entries {
             match entry {
-                XrefEntry::Normal { offset, .. } => {
+                XrefEntry::Normal { offset, generation } => {
+                    let expected_id = (obj_num, generation);
                     if let Ok((obj_id, raw_bytes)) = self.extract_raw_object(offset as usize) {
-                        self.raw_objects.insert(obj_id, raw_bytes);
+                        if obj_id != expected_id {
+                            if self.strict {
+                                return Err(Error::ObjectIdMismatch);
+                            }
+                            warn!("Skipping encrypted object with mismatched identity at offset {offset}");
+                            continue;
+                        }
+                        self.raw_objects.insert(expected_id, raw_bytes);
                     }
                 }
                 XrefEntry::Compressed { container, index } => {
                     // Store compressed object info for later processing
                     object_streams.push((obj_num, container, index));
                 }
-                XrefEntry::Free | XrefEntry::UnusableFree => {
-                    // Skip free entries
+                XrefEntry::Free { .. } | XrefEntry::UnusableFree | XrefEntry::Null => {
+                    // Free entries and null authority do not materialize objects.
                 }
             }
         }
@@ -884,9 +868,9 @@ impl Reader<'_> {
                     continue;
                 }
 
-                if let Ok((id, mut obj)) = self.parse_raw_object(raw_bytes) {
+                if let Ok((_, mut obj)) = self.parse_raw_object(raw_bytes, *obj_id) {
                     let _ = encryption::decrypt_object(state, *obj_id, &mut obj);
-                    self.document.objects.insert(id, obj);
+                    self.document.objects.insert(*obj_id, obj);
                 }
             }
 
@@ -902,12 +886,15 @@ impl Reader<'_> {
             for (container_id, objects_in_stream) in streams_to_process {
                 if let Some(container_obj) = self.document.objects.get(&(container_id, 0))
                     && let Ok(stream) = container_obj.as_stream()
+                    && stream.dict.has_type(b"ObjStm")
                 {
-                    match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
+                    match ObjectStream::parse_indexed_with_limit(stream, self.max_decompressed_size) {
                         Ok(object_stream) => {
-                            for (obj_num, _index) in objects_in_stream {
+                            for (obj_num, index) in objects_in_stream {
                                 let obj_id = (obj_num, 0);
-                                if let Some(obj) = object_stream.objects.get(&obj_id) {
+                                if let Some((member_id, obj)) = object_stream.get(&usize::from(index))
+                                    && *member_id == obj_id
+                                {
                                     self.document.objects.insert(obj_id, obj.clone());
                                 }
                             }
@@ -933,9 +920,9 @@ impl Reader<'_> {
         Ok(())
     }
 
-    fn parse_raw_object(&self, raw_bytes: &[u8]) -> Result<(ObjectId, Object)> {
+    fn parse_raw_object(&self, raw_bytes: &[u8], expected_id: ObjectId) -> Result<(ObjectId, Object)> {
         // Parse the raw bytes as an indirect object
-        parser::indirect_object(raw_bytes, 0, None, self, &mut HashSet::new(), None)
+        parser::indirect_object(raw_bytes, 0, Some(expected_id), self, &mut HashSet::new(), None)
     }
 
     /// Install a fully merged cross-reference table and derive its sorted
@@ -961,32 +948,16 @@ impl Reader<'_> {
         let zero_length_streams = Mutex::new(vec![]);
         let object_streams = Mutex::new(vec![]);
 
-        // Build a map of which container each compressed object belongs to
-        // according to the xref. This prevents stale ObjStm copies (e.g., from
-        // linearization first-page sections) from overriding the correct version.
-        let compressed_obj_containers: BTreeMap<u32, u32> = self
-            .document
-            .reference_table
-            .entries
-            .iter()
-            .filter_map(|(&id, entry)| {
-                if let XrefEntry::Compressed { container, .. } = entry {
-                    Some((id, *container))
-                } else {
-                    None
-                }
-            })
-            .collect();
         let normal_offsets = &self.normal_offsets;
 
-        let entries_filter_map = |(_, entry): (&_, &_)| -> Result<Option<(ObjectId, Object)>> {
-            if let XrefEntry::Normal { offset, .. } = *entry {
+        let entries_filter_map = |(&id, entry): (&_, &_)| -> Result<Option<(ObjectId, Object)>> {
+            if let XrefEntry::Normal { offset, generation } = *entry {
                 // read_object now handles decryption internally
                 let offset = offset as usize;
                 let next_index = normal_offsets.partition_point(|&next| next <= offset);
                 let next_object = normal_offsets.get(next_index).copied();
                 let end = self.object_end(offset, next_object);
-                let result = self.read_object_to(offset, end, None, &mut HashSet::new());
+                let result = self.read_object_to(offset, end, Some((id, generation)), &mut HashSet::new());
                 let (object_id, mut object) = match result {
                     Ok(obj) => obj,
                     Err(e) => {
@@ -1010,35 +981,44 @@ impl Reader<'_> {
 
                 if let Ok(stream) = object.as_stream() {
                     if stream.dict.has_type(b"ObjStm") && !is_encrypted {
-                        let obj_stream = match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
-                            Ok(obj_stream) => obj_stream,
-                            // Not an encryption-related loss, so it obeys the same
-                            // strict-mode policy as any other load error.
-                            Err(e) => {
-                                error!("Object stream load error for {object_id:?}: {e:?}");
-                                return if self.strict { Err(e) } else { Ok(None) };
-                            }
-                        };
+                        let obj_stream =
+                            match ObjectStream::parse_indexed_with_limit(stream, self.max_decompressed_size) {
+                                Ok(obj_stream) => obj_stream,
+                                // Not an encryption-related loss, so it obeys the same
+                                // strict-mode policy as any other load error.
+                                Err(e) => {
+                                    error!("Object stream load error for {object_id:?}: {e:?}");
+                                    return if self.strict { Err(e) } else { Ok(None) };
+                                }
+                            };
                         let container_id = object_id.0;
                         let mut object_streams = object_streams.lock().unwrap();
                         if let Some(filter_func) = filter_func {
                             let objects: BTreeMap<(u32, u16), Object> = obj_stream
-                                .objects
                                 .into_iter()
-                                .filter(|((obj_num, _), _)| {
-                                    compressed_obj_containers
-                                        .get(obj_num)
-                                        .is_none_or(|&c| c == container_id)
+                                .filter(|(index, ((obj_num, _), _))| {
+                                    self.document.reference_table.allows_compressed_object(
+                                        *obj_num,
+                                        container_id,
+                                        *index,
+                                    )
                                 })
-                                .filter_map(|(object_id, mut object)| filter_func(object_id, &mut object))
+                                .filter_map(|(_, (object_id, mut object))| filter_func(object_id, &mut object))
                                 .collect();
                             object_streams.extend(objects);
                         } else {
-                            object_streams.extend(obj_stream.objects.into_iter().filter(|((obj_num, _), _)| {
-                                compressed_obj_containers
-                                    .get(obj_num)
-                                    .is_none_or(|&c| c == container_id)
-                            }));
+                            object_streams.extend(
+                                obj_stream
+                                    .into_iter()
+                                    .filter(|(index, ((obj_num, _), _))| {
+                                        self.document.reference_table.allows_compressed_object(
+                                            *obj_num,
+                                            container_id,
+                                            *index,
+                                        )
+                                    })
+                                    .map(|(_, member)| member),
+                            );
                         }
                     } else if stream.content.is_empty() {
                         let mut zero_length_streams = zero_length_streams.lock().unwrap();
@@ -1149,20 +1129,29 @@ impl Reader<'_> {
     }
 
     /// Load a compressed object from an object stream (for lightweight metadata extraction)
-    fn get_compressed_object(&self, id: ObjectId) -> Result<Object> {
+    fn get_compressed_object(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
         let entry = self.document.reference_table.get(id.0).ok_or(Error::MissingXrefEntry)?;
 
-        let container_id = match entry {
-            XrefEntry::Compressed { container, .. } => *container,
+        let (container_id, index) = match entry {
+            XrefEntry::Compressed { container, index } => (*container, *index),
             _ => return Err(Error::MissingXrefEntry),
         };
 
         let container_id = (container_id, 0);
-        let mut already_seen = HashSet::new();
-        let container_obj = self.get_object(container_id, &mut already_seen)?;
+        // A stream cannot be an object-stream member. Require direct authority
+        // before resolving the container, so compressed-container chains cannot recurse.
+        self.get_offset(container_id)?;
+        let container_obj = self.get_object(container_id, already_seen)?;
         let container_stream = container_obj.as_stream()?;
-        let object_stream = ObjectStream::new_with_limit(container_stream, self.max_decompressed_size)?;
-        object_stream.objects.get(&id).cloned().ok_or(Error::MissingXrefEntry)
+        if !container_stream.dict.has_type(b"ObjStm") {
+            return Err(Error::InvalidObjectStream("container must have /Type /ObjStm".into()));
+        }
+        let object_stream = ObjectStream::parse_indexed_with_limit(container_stream, self.max_decompressed_size)?;
+        object_stream
+            .get(&usize::from(index))
+            .filter(|(member_id, _)| *member_id == id)
+            .map(|(_, object)| object.clone())
+            .ok_or(Error::MissingXrefEntry)
     }
 
     pub fn get_object(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
@@ -1175,7 +1164,7 @@ impl Reader<'_> {
         if let Some(entry) = self.document.reference_table.get(id.0)
             && matches!(entry, XrefEntry::Compressed { .. })
         {
-            return self.get_compressed_object(id);
+            return self.get_compressed_object(id, already_seen);
         }
 
         let offset = self.get_offset(id)?;
@@ -1205,7 +1194,7 @@ impl Reader<'_> {
                 let (_, encrypt_obj) = self.read_object(offset as usize, Some(encrypt_ref), &mut HashSet::new())?;
                 self.document.objects.insert(encrypt_ref, encrypt_obj);
             } else if let Some(raw_bytes) = self.raw_objects.get(&encrypt_ref)
-                && let Ok((_, obj)) = self.parse_raw_object(raw_bytes)
+                && let Ok((_, obj)) = self.parse_raw_object(raw_bytes, encrypt_ref)
             {
                 self.document.objects.insert(encrypt_ref, obj);
             }
@@ -1348,234 +1337,209 @@ impl Reader<'_> {
         parser::indirect_object(self.buffer, offset, expected_id, self, already_seen, Some(end))
     }
 
-    /// Parse the cross-reference section recorded at `offset`, first correcting
-    /// the offset if it is slightly miswritten (lenient mode only).
-    fn xref_and_trailer_at(&self, offset: usize) -> Result<(Xref, Dictionary)> {
-        let offset = self.correct_xref_offset(offset);
-        parser::xref_and_trailer(&self.buffer[offset..], self)
+    /// Physical object headers cannot establish effective revision state, even
+    /// when only one revision is apparent: an xref may free a physically present
+    /// object or authorize a different generation or compressed member.
+    /// Only recovery that resolves actual xref sections is supported.
+    fn resolve_authoritative_xref_and_trailer(&mut self, header_version: &str) -> Result<(Xref, Dictionary)> {
+        self.resolve_xref_and_trailer(header_version).map_err(|err| match err {
+            // Preserve strict-mode diagnostics and established topology errors.
+            Error::Xref(XrefError::PrevStart | XrefError::StreamStart | XrefError::AmbiguousStart) => err,
+            // Resource/decoder failures already require explicit failure.
+            Error::Decompress(_) => err,
+            err if self.strict => err,
+            source => Error::ReconstructionAuthority {
+                source: Box::new(source),
+            },
+        })
     }
 
     /// Resolve the cross-reference table/stream and trailer, including the
     /// `/Prev` chain, and record the resolved start offset on the document.
-    fn resolve_xref_and_trailer(&mut self) -> Result<(Xref, Dictionary)> {
+    fn resolve_xref_and_trailer(&mut self, header_version: &str) -> Result<(Xref, Dictionary)> {
         let xref_start = Self::get_xref_start(self.buffer)?;
         if xref_start > self.buffer.len() {
             return Err(Error::Xref(XrefError::Start));
         }
-        let xref_start = self.correct_xref_offset(xref_start);
+        let requested = xref_start;
+        let xref_start = self.correct_final_xref_offset(requested)?;
         self.document.xref_start = xref_start;
 
-        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
+        let (remaining, (mut xref, mut trailer)) =
+            parser::xref_and_trailer_with_remainder(&self.buffer[xref_start..], self).map_err(|err| {
+                if xref_start != requested {
+                    Error::Xref(XrefError::AmbiguousStart)
+                } else {
+                    err
+                }
+            })?;
 
-        // Read previous Xrefs of linearized or incremental updated document.
-        let mut already_seen = HashSet::new();
-        let mut prev_xref_start = trailer.remove(b"Prev");
-        while let Some(prev) = prev_xref_start.and_then(|offset| offset.as_i64().ok()) {
-            if already_seen.contains(&prev) {
-                break;
-            }
-            already_seen.insert(prev);
-            if prev < 0 || prev as usize > self.buffer.len() {
-                return Err(Error::Xref(XrefError::PrevStart));
-            }
+        let size_bound = u32::try_from(
+            trailer
+                .get(b"Size")
+                .and_then(Object::as_i64)
+                .map_err(|_| ParseError::InvalidTrailer)?,
+        )
+        .map_err(|_| ParseError::InvalidTrailer)?;
 
-            let (prev_xref, prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
-            xref.merge(prev_xref);
+        // Some authoritative section must end at the final footer. In a fresh
+        // linearized file this is the main section, not the entry section.
+        // Use parsed ends so marker bytes in values cannot establish authority.
+        let final_eof =
+            Self::search_substring(self.buffer, b"%%EOF", 0).ok_or(Error::Xref(XrefError::AmbiguousStart))?;
+        let final_start = Self::search_substring(&self.buffer[..final_eof], b"startxref", final_eof.saturating_sub(25))
+            .ok_or(Error::Xref(XrefError::AmbiguousStart))?;
+        let mut terminal_reached = self.buffer.len() - remaining.len() == final_start;
 
-            // Read xref stream in hybrid-reference file
-            let prev_xref_stream_start = trailer.remove(b"XRefStm");
-            if let Some(prev) = prev_xref_stream_start.and_then(|offset| offset.as_i64().ok()) {
-                if prev < 0 || prev as usize > self.buffer.len() {
+        // Newest revision first: an effective entry, including a free entry,
+        // cannot be displaced by any older revision.
+        let mut already_seen = HashSet::from([xref_start]);
+        let mut revision_trailer = trailer.clone();
+        let mut revision_type = xref.cross_reference_type;
+        let mut current = xref_start;
+        loop {
+            if let Ok(value) = revision_trailer.get(b"XRefStm") {
+                if !matches!(revision_type, XrefType::CrossReferenceTable) {
                     return Err(Error::Xref(XrefError::StreamStart));
                 }
-
-                let (prev_xref, _) = self.xref_and_trailer_at(prev as usize)?;
-                xref.merge(prev_xref);
+                // ISO 32000-1:2008 7.5.8.4 prohibited /XRefStm in the main section;
+                // ISO 32000-2 removed that prohibition. Before xref resolution, only
+                // the header version is available. Catalog /Version may raise the
+                // effective version, but needs resolved xref state and is outside this check.
+                let pdf_2_or_later = header_version
+                    .split_once('.')
+                    .and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)))
+                    .is_some_and(|version| version >= (2, 0));
+                if !revision_trailer.has(b"Prev") && !pdf_2_or_later {
+                    if self.strict {
+                        return Err(Error::Xref(XrefError::StreamStart));
+                    }
+                    warn!("First cross-reference section contains /XRefStm without /Prev; accepting in lenient mode");
+                }
+                let offset = value
+                    .as_i64()
+                    .ok()
+                    .and_then(|v| usize::try_from(v).ok())
+                    .filter(|&v| v < self.buffer.len())
+                    .ok_or(Error::Xref(XrefError::StreamStart))?;
+                if !already_seen.insert(offset) {
+                    return Err(Error::Xref(XrefError::StreamStart));
+                }
+                let (supplement, supplement_trailer) = parser::xref_and_trailer(&self.buffer[offset..], self)
+                    .map_err(|_| Error::Xref(XrefError::StreamStart))?;
+                if !matches!(supplement.cross_reference_type, XrefType::CrossReferenceStream)
+                    || !supplement_trailer.has_type(b"XRef")
+                {
+                    return Err(Error::Xref(XrefError::StreamStart));
+                }
+                xref.merge(supplement);
             }
-
-            prev_xref_start = prev_trailer.get(b"Prev").cloned().ok();
+            let Ok(value) = revision_trailer.get(b"Prev") else {
+                break;
+            };
+            let requested = value
+                .as_i64()
+                .ok()
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|&v| v < self.buffer.len())
+                .ok_or(Error::Xref(XrefError::PrevStart))?;
+            let offset = self.correct_xref_offset(requested);
+            if offset != requested {
+                // A nearby keyword alone is not proof of revision identity.
+                // Permit only a displaced pointer within the keyword or its
+                // surrounding whitespace, rather than jumping across content.
+                let displacement_is_local = if requested >= offset {
+                    requested <= offset + 4 || self.buffer[offset + 4..requested].iter().all(u8::is_ascii_whitespace)
+                } else {
+                    self.buffer[requested..offset].iter().all(u8::is_ascii_whitespace)
+                };
+                if !displacement_is_local {
+                    return Err(Error::Xref(XrefError::PrevStart));
+                }
+            }
+            let entry_only = current == xref_start && already_seen.len() == 1;
+            if !already_seen.insert(offset) {
+                return Err(Error::Xref(XrefError::PrevStart));
+            }
+            let (remaining, (previous, previous_trailer)) =
+                parser::xref_and_trailer_with_remainder(&self.buffer[offset..], self)
+                    .map_err(|_| Error::Xref(XrefError::PrevStart))?;
+            let terminal = self.buffer.len() - remaining.len() == final_start;
+            if offset >= current {
+                let fresh_linearized = entry_only
+                    && !terminal_reached
+                    && terminal
+                    && !previous_trailer.has(b"Prev")
+                    && !previous_trailer.has(b"XRefStm")
+                    && self.has_fresh_linearization_dictionary(xref_start);
+                if !fresh_linearized {
+                    return Err(Error::Xref(XrefError::PrevStart));
+                }
+            }
+            terminal_reached |= terminal;
+            revision_type = previous.cross_reference_type;
+            xref.merge(previous);
+            revision_trailer = previous_trailer;
+            current = offset;
         }
-        let xref_entry_count = xref.max_id().checked_add(1).ok_or(ParseError::InvalidXref)?;
-        if xref.size != xref_entry_count {
-            warn!(
-                "Size entry of trailer dictionary is {}, correct value is {}.",
-                xref.size, xref_entry_count
-            );
-            xref.size = xref_entry_count;
+        if !terminal_reached {
+            return Err(Error::Xref(XrefError::AmbiguousStart));
         }
+        trailer.remove(b"Prev");
+        trailer.remove(b"XRefStm");
+        // The authoritative trailer bounds entries from every revision and supplement.
+        xref.entries.retain(|&id, _| id < size_bound);
+        xref.size = size_bound;
 
         Ok((xref, trailer))
     }
 
-    /// Last-resort recovery: rebuild the cross-reference table by scanning the
-    /// raw bytes for indirect-object headers and locating a trailer with a
-    /// usable `/Root`. Returns `None` (caller keeps the original error) when
-    /// strict mode forbids recovery or nothing usable was found.
-    fn reconstruct_xref_and_trailer(&mut self) -> Option<(Xref, Dictionary)> {
-        if self.strict {
-            return None;
-        }
-        u32::try_from(self.buffer.len()).ok()?;
-
-        let markers = Self::scan_object_markers(self.buffer);
-        if markers.is_empty() {
-            return None;
-        }
-
-        let mut xref = Xref::new(markers.len() as u32, XrefType::CrossReferenceTable);
-        for (offset, (number, generation)) in markers {
-            // Incremental updates append, so later revisions win.
-            xref.insert(number, XrefEntry::Normal { offset, generation });
-        }
-        // Normalize like `resolve_xref_and_trailer`: size spans object numbers
-        // up to the highest, not physical copies across incremental updates.
-        xref.size = xref.max_id().saturating_add(1);
-
-        let (_trailer_pos, trailer) = self.find_latest_trailer(&xref)?;
-        // deliberate: no on-disk table exists to point at. Zero marks the
-        // offset "unknown" so `Document::new_from_prev` omits `/Prev` instead
-        // of recording end-of-file; `object_end` clamps to the buffer either way.
-        self.document.xref_start = 0;
-
-        warn!(
-            "reconstructed cross-reference table with {} objects by scanning for indirect objects",
-            xref.entries.len()
-        );
-        Some((xref, trailer))
-    }
-
-    /// Collect `(offset, id)` of every indirect-object header in one pass.
-    /// Only headers starting a line (optional leading blanks allowed) count,
-    /// stream payloads are skipped wholesale, and object numbers beyond
-    /// [`MAX_RECONSTRUCTED_OBJECTS`] are rejected so a forged header can
-    /// neither shadow a genuine entry nor poison the reconstructed size.
-    fn scan_object_markers(buffer: &[u8]) -> Vec<(u32, ObjectId)> {
-        const STREAM_KEYWORD: &[u8] = b"stream";
-        const END_STREAM_KEYWORD: &[u8] = b"endstream";
-
-        let mut markers = Vec::new();
-        let mut oversized_number_warned = false;
-        let mut at_line_start = true;
-        let mut pos = 0;
-        while pos < buffer.len() {
-            // Skip raw stream data: an uncompressed payload may embed
-            // convincing `N G obj` lines whose later offsets would otherwise
-            // override the genuine entries for those object numbers.
-            if buffer[pos..].starts_with(STREAM_KEYWORD)
-                && !buffer[..pos].ends_with(b"end")
-                && matches!(buffer.get(pos + STREAM_KEYWORD.len()), Some(b'\r' | b'\n'))
-            {
-                let after_keyword = pos + STREAM_KEYWORD.len();
-                if let Some(relative) = buffer[after_keyword..]
-                    .windows(END_STREAM_KEYWORD.len())
-                    .position(|window| window == END_STREAM_KEYWORD)
-                {
-                    pos = after_keyword + relative + END_STREAM_KEYWORD.len();
-                    at_line_start = false;
-                    continue;
+    /// Prove the first body object is a complete linearization dictionary.
+    /// /L excludes appended updates; supporting those needs a stronger topology
+    /// proof. /T is checked only for its required type, never used as authority.
+    fn has_fresh_linearization_dictionary(&self, entry: usize) -> bool {
+        fn skip_space(mut input: &[u8]) -> &[u8] {
+            loop {
+                input = input.trim_ascii_start();
+                if input.first() != Some(&b'%') {
+                    return input;
                 }
-                // Damaged stream without terminator: fall back to the
-                // dictionary's /Length hint so the payload cannot hide
-                // line-start pseudo headers, while objects written after it
-                // stay reachable.
-                if let Some(resume) = Self::payload_end_by_length(buffer, pos) {
-                    pos = resume;
-                    at_line_start = false;
-                    continue;
-                }
-                // Unusable /Length too: nothing bounds the payload, so keep
-                // scanning byte by byte rather than dropping what follows.
+                let Some(end) = input.iter().position(|b| matches!(b, b'\r' | b'\n')) else {
+                    return &[];
+                };
+                input = &input[end..];
             }
-            // Anchor at line starts so pseudo headers buried after another
-            // token (string literal, comment) are never mistaken for markers.
-            if at_line_start
-                && buffer[pos].is_ascii_digit()
-                && let Some(id) = Self::parse_object_header(&buffer[pos..])
-            {
-                // A huge bogus number would inflate `size` (and thus
-                // `max_id`) via `Xref::insert`; genuine numbering stays
-                // within the same cap as the marker count.
-                if id.0 > MAX_RECONSTRUCTED_OBJECTS as u32 {
-                    if !oversized_number_warned {
-                        warn!("ignoring object headers numbered above {MAX_RECONSTRUCTED_OBJECTS}");
-                        oversized_number_warned = true;
-                    }
-                } else {
-                    if markers.len() == MAX_RECONSTRUCTED_OBJECTS {
-                        warn!(
-                            "object marker scan stopped at the {MAX_RECONSTRUCTED_OBJECTS}-marker cap; reconstruction may be incomplete"
-                        );
-                        break;
-                    }
-                    markers.push((pos as u32, id));
-                }
-            }
-            match buffer[pos] {
-                b'\r' | b'\n' => at_line_start = true,
-                b' ' | b'\t' => {}
-                _ => at_line_start = false,
-            }
-            pos += 1;
         }
-        markers
-    }
-
-    /// Resume offset past a stream payload according to a *direct* `/Length`
-    /// integer in the dictionary preceding the `stream` keyword at
-    /// `stream_pos`. The search is scoped to the current object (after the
-    /// nearest preceding `obj` keyword) so a missing `/Length` cannot latch
-    /// onto a previous object's value. Returns `None` when the hint is
-    /// absent, indirect, or points outside the buffer — damaged files tend
-    /// to carry wrong `/Length` values, so it must stay a hint, never a hard
-    /// boundary.
-    fn payload_end_by_length(buffer: &[u8], stream_pos: usize) -> Option<usize> {
-        const LENGTH_KEY: &[u8] = b"/Length";
-        const OBJ_KEYWORD: &[u8] = b"obj";
-        const STREAM_KEYWORD_LEN: usize = b"stream".len();
-
-        let head = &buffer[..stream_pos];
-        let obj_pos = head
-            .windows(OBJ_KEYWORD.len())
-            .rposition(|window| window == OBJ_KEYWORD)?;
-        let dict_region = &buffer[obj_pos + OBJ_KEYWORD.len()..stream_pos];
-        // Nearest `/Length` in this object's dictionary; parsing it validates
-        // that the match really is a key with an integer value.
-        let key_pos = dict_region
-            .windows(LENGTH_KEY.len())
-            .rposition(|window| window == LENGTH_KEY)?;
-        let rest = &dict_region[key_pos + LENGTH_KEY.len()..];
-        let digits_start = rest.iter().position(u8::is_ascii_digit)?;
-        let digits_len = rest[digits_start..]
-            .iter()
-            .take_while(|byte| byte.is_ascii_digit())
-            .count();
-        if digits_len > 10 {
-            return None;
+        let input = skip_space(&self.buffer[..self.buffer.len().min(1024).min(entry)]);
+        if !matches!(Self::parse_object_header(input), Some((1.., 0))) {
+            return false;
         }
-        // An indirect reference (`/Length 5 0 R`) continues with another
-        // number token; a direct integer ends at a name, `>>`, or the keyword.
-        match rest[digits_start + digits_len..]
-            .iter()
-            .copied()
-            .find(|byte| !byte.is_ascii_whitespace())
-        {
-            Some(b'/') | Some(b'>') => {}
-            _ => return None,
-        }
-        let length: usize = std::str::from_utf8(&rest[digits_start..digits_start + digits_len])
-            .ok()?
-            .parse()
-            .ok()?;
-        // Spec: the EOL after the `stream` keyword counts as CRLF or LF.
-        let eol_len = match (
-            buffer.get(stream_pos + STREAM_KEYWORD_LEN),
-            buffer.get(stream_pos + STREAM_KEYWORD_LEN + 1),
-        ) {
-            (Some(b'\r'), Some(b'\n')) => 2,
-            _ => 1,
+        let Some(header_end) = input.windows(3).position(|w| w == b"obj") else {
+            return false;
         };
-        let end = (stream_pos + STREAM_KEYWORD_LEN + eol_len).checked_add(length)?;
-        (buffer.len() >= end).then_some(end)
+        let Ok((remaining, dict)) = parser::dictionary(skip_space(&input[header_end + 3..])) else {
+            return false;
+        };
+        let Some(tail) = skip_space(remaining).strip_prefix(b"endobj") else {
+            return false;
+        };
+        if !tail.is_empty() && !tail[0].is_ascii_whitespace() && tail[0] != b'%' {
+            return false;
+        }
+        let integer = |key: &[u8]| dict.get(key).ok().and_then(|v| v.as_i64().ok());
+        let version = dict.get(b"Linearized").ok().and_then(|v| v.as_float().ok());
+        let hints_valid = dict
+            .get(b"H")
+            .ok()
+            .and_then(|v| v.as_array().ok())
+            .is_some_and(|h| matches!(h.len(), 2 | 4) && h.iter().all(|v| v.as_i64().is_ok_and(|v| v >= 0)));
+        version == Some(1.0)
+            && integer(b"L").and_then(|v| usize::try_from(v).ok()) == Some(self.buffer.len())
+            && integer(b"O").is_some_and(|v| v > 0)
+            && integer(b"E").is_some_and(|v| v > 0)
+            && integer(b"N").is_some_and(|v| v > 0)
+            && integer(b"T").is_some_and(|v| v >= 0)
+            && hints_valid
     }
 
     /// Parse an `N G obj` header; the byte after `obj` must end the token.
@@ -1608,31 +1572,42 @@ impl Reader<'_> {
         Some((number, generation))
     }
 
-    /// Newest backwards-scanned `trailer` whose `/Root` references a scanned object.
-    fn find_latest_trailer(&self, xref: &Xref) -> Option<(usize, Dictionary)> {
-        let mut bound = self.buffer.len();
-        for _ in 0..MAX_TRAILER_CANDIDATES {
-            let Some(pos) = Reader::search_substring(&self.buffer[..bound], b"trailer", 0) else {
-                break;
-            };
-            bound = pos;
-
-            let after_keyword = &self.buffer[pos + b"trailer".len()..];
-            let Some(dict_start) = after_keyword.iter().position(|byte| !byte.is_ascii_whitespace()) else {
-                continue;
-            };
-            let Ok((_, dict)) = parser::dictionary(&after_keyword[dict_start..]) else {
-                continue;
-            };
-            if dict
-                .get(b"Root")
-                .and_then(Object::as_reference)
-                .is_ok_and(|root| xref.entries.contains_key(&root.0))
-            {
-                return Some((pos, dict));
-            }
+    /// Final-start recovery must identify one local section in the final revision.
+    /// Exact and corrected candidates also undergo parsed final-footer validation.
+    fn correct_final_xref_offset(&self, requested: usize) -> Result<usize> {
+        let corrected = self.correct_xref_offset(requested);
+        if corrected == requested {
+            return Ok(requested);
         }
-        None
+        let ambiguous = || Error::Xref(XrefError::AmbiguousStart);
+        let start = requested.saturating_sub(64);
+        let end = self.buffer.len().min(requested.saturating_add(64));
+        let candidates = (start..end.saturating_sub(4))
+            .filter(|&pos| {
+                self.buffer[pos..].starts_with(b"xref")
+                    && (pos == 0 || !self.buffer[pos - 1].is_ascii_alphanumeric())
+                    && self.buffer.get(pos + 4).is_some_and(u8::is_ascii_whitespace)
+            })
+            .count();
+        if candidates != 1 {
+            return Err(ambiguous());
+        }
+        let local = if requested >= corrected {
+            requested <= corrected + 4
+                || self.buffer[corrected + 4..requested]
+                    .iter()
+                    .all(u8::is_ascii_whitespace)
+        } else {
+            self.buffer[requested..corrected].iter().all(u8::is_ascii_whitespace)
+        };
+        // Any EOF between the chosen section and the final EOF means recovery
+        // could omit a completed revision. Treat even uncertain markers as a
+        // boundary here: lenient correction must not manufacture completeness.
+        let final_eof = Self::search_substring(self.buffer, b"%%EOF", 0).ok_or_else(ambiguous)?;
+        if !local || corrected >= final_eof || self.buffer[corrected..final_eof].windows(5).any(|w| w == b"%%EOF") {
+            return Err(ambiguous());
+        }
+        Ok(corrected)
     }
 
     /// Some generators write `startxref` (or trailer `Prev`) values that are
@@ -1827,7 +1802,7 @@ endstream endobj\n",
     );
     let doc = format!(
         "{}xref
-0 7
+0 8
 0000000000 65535 f 
 0000000009 00000 n 
 0000000096 00000 n 
@@ -1837,7 +1812,7 @@ endstream endobj\n",
 0000000254 00000 n 
 0000000297 00000 n 
 trailer
-<</Root 6 0 R/Size 7>>
+<</Root 6 0 R/Size 8>>
 startxref
 {}
 %%EOF",

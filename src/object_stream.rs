@@ -51,6 +51,20 @@ impl ObjectStream {
     /// decoded content if it would exceed `max_decompressed_size` bytes. `None`
     /// means no limit (the behavior of [`ObjectStream::new`]).
     pub fn new_with_limit(stream: &Stream, max_decompressed_size: Option<usize>) -> Result<ObjectStream> {
+        let objects = Self::parse_indexed_with_limit(stream, max_decompressed_size)?
+            .into_values()
+            .collect();
+        Ok(ObjectStream {
+            objects,
+            max_objects: 100,
+            compression_level: 6,
+        })
+    }
+
+    /// Keep header ordinals, including gaps from unreadable members and duplicate IDs.
+    pub(crate) fn parse_indexed_with_limit(
+        stream: &Stream, max_decompressed_size: Option<usize>,
+    ) -> Result<BTreeMap<usize, (ObjectId, Object)>> {
         let content = match max_decompressed_size {
             // Object streams are decoded while the document is loaded, so
             // enforcing the limit here bounds the memory a single stream can use.
@@ -59,11 +73,7 @@ impl ObjectStream {
         };
 
         if content.is_empty() {
-            return Ok(ObjectStream {
-                objects: BTreeMap::new(),
-                max_objects: 100,
-                compression_level: 6,
-            });
+            return Ok(BTreeMap::new());
         }
 
         let first_offset = stream
@@ -86,7 +96,7 @@ impl ObjectStream {
             warn!("object stream: the object stream dictionary specifies a wrong number of objects")
         }
 
-        let chunks_filter_map = |chunk: &[_]| {
+        let chunks_filter_map = |(index, chunk): (usize, &[_])| {
             let id = chunk[0]?;
             let offset = first_offset + chunk[1]? as usize;
 
@@ -105,18 +115,22 @@ impl ObjectStream {
             }
             let object = parser::direct_object(&content[start..])?;
 
-            Some(((id, 0), object))
+            Some((index, ((id, 0), object)))
         };
         #[cfg(feature = "rayon")]
-        let objects = numbers[..len].par_chunks(2).filter_map(chunks_filter_map).collect();
+        let objects = numbers[..len]
+            .par_chunks(2)
+            .enumerate()
+            .filter_map(chunks_filter_map)
+            .collect();
         #[cfg(not(feature = "rayon"))]
-        let objects = numbers[..len].chunks(2).filter_map(chunks_filter_map).collect();
+        let objects = numbers[..len]
+            .chunks(2)
+            .enumerate()
+            .filter_map(chunks_filter_map)
+            .collect();
 
-        Ok(ObjectStream {
-            objects,
-            max_objects: 100,
-            compression_level: 6,
-        })
+        Ok(objects)
     }
 
     /// Create a builder for constructing new object streams

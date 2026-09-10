@@ -11,7 +11,9 @@ pub struct Xref {
     /// Entries for indirect object.
     pub entries: BTreeMap<u32, XrefEntry>,
 
-    /// Total number of entries (including free entries), equal to the highest object number plus 1.
+    /// Object number upper bound (exclusive). For a loaded document, this is the
+    /// authoritative trailer's Size, which may exceed the highest entry plus 1.
+    /// During section construction, insertion also raises this to cover inserted ids.
     pub size: u32,
 }
 
@@ -25,10 +27,23 @@ pub enum XrefType {
 
 #[derive(Debug, Clone)]
 pub enum XrefEntry {
-    Free, // TODO add generation number
+    /// Cross-reference-stream authority interpreted as a reference to the null object.
+    Null,
+    /// A free-list entry, including the next free object and reuse generation.
+    Free {
+        next_free: u32,
+        generation: u16,
+    },
+    /// Writer shorthand for a free entry that cannot be reused (generation 65535).
     UnusableFree,
-    Normal { offset: u32, generation: u16 },
-    Compressed { container: u32, index: u16 },
+    Normal {
+        offset: u32,
+        generation: u16,
+    },
+    Compressed {
+        container: u32,
+        index: u16,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +78,16 @@ impl Xref {
         }
     }
 
+    /// Materialize only members explicitly identified by the effective xref.
+    pub(crate) fn allows_compressed_object(&self, id: u32, container_id: u32, member_index: usize) -> bool {
+        match self.get(id) {
+            Some(XrefEntry::Compressed { container, index }) => {
+                *container == container_id && usize::from(*index) == member_index
+            }
+            _ => false,
+        }
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear()
     }
@@ -84,16 +109,24 @@ impl XrefEntry {
         matches!(*self, XrefEntry::Compressed { .. })
     }
 
-    /// Encode entry for use in cross-reference stream
-    pub fn encode_for_xref_stream(&self, widths: &[usize; 3]) -> Vec<u8> {
+    /// Encode an entry for a cross-reference stream, rejecting input-only null authority.
+    pub fn encode_for_xref_stream(&self, widths: &[usize; 3]) -> Result<Vec<u8>> {
         let mut result = Vec::new();
 
         match self {
-            XrefEntry::Free | XrefEntry::UnusableFree => {
+            XrefEntry::Null => return Err(null_serialization_error()),
+            XrefEntry::Free { next_free, generation } => {
                 // Type 0: Free object
                 encode_field(0, widths[0], &mut result);
-                encode_field(0, widths[1], &mut result); // Next free object
-                encode_field(0, widths[2], &mut result); // Generation
+                encode_field(*next_free as u64, widths[1], &mut result);
+                encode_field(*generation as u64, widths[2], &mut result);
+            }
+            XrefEntry::UnusableFree => {
+                return XrefEntry::Free {
+                    next_free: 0,
+                    generation: u16::MAX,
+                }
+                .encode_for_xref_stream(widths);
             }
             XrefEntry::Normal { offset, generation } => {
                 // Type 1: Uncompressed object
@@ -109,20 +142,29 @@ impl XrefEntry {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Write Entry in Cross Reference Table.
+    ///
+    /// A compressed entry has no classic-table representation: an object inside an
+    /// object stream can only be located through a type-2 cross-reference-stream
+    /// entry. Writing one here would present a live object as free, so it is
+    /// refused with [`std::io::ErrorKind::Unsupported`] instead.
     pub fn write_xref_entry(&self, file: &mut dyn Write) -> Result<()> {
         match self {
+            XrefEntry::Null => return Err(null_serialization_error()),
             XrefEntry::Normal { offset, generation } => {
                 writeln!(file, "{offset:>010} {generation:>05} n ")?;
             }
-            XrefEntry::Compressed { container: _, index: _ } => {
-                writeln!(file, "{:>010} {:>05} f ", 0, 65535)?;
+            XrefEntry::Compressed { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "a compressed cross-reference entry requires cross-reference stream authority",
+                ));
             }
-            XrefEntry::Free => {
-                writeln!(file, "{:>010} {:>05} f ", 0, 0)?;
+            XrefEntry::Free { next_free, generation } => {
+                writeln!(file, "{next_free:>010} {generation:>05} f ")?;
             }
             XrefEntry::UnusableFree => {
                 writeln!(file, "{:>010} {:>05} f ", 0, 65535)?;
@@ -153,8 +195,22 @@ impl XrefSection {
     }
 
     /// Write Section in Cross Reference Table.
+    ///
+    /// Refuses a section holding compressed entries or null authority with
+    /// [`std::io::ErrorKind::Unsupported`] before the section header is written:
+    /// a classic table cannot locate objects inside object streams.
     pub fn write_xref_section(&self, file: &mut dyn Write) -> Result<()> {
         if !self.is_empty() {
+            if self
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, XrefEntry::Compressed { .. } | XrefEntry::Null))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "compressed entries and null authority cannot be written to a classic cross-reference table",
+                ));
+            }
             // Write section range
             writeln!(file, "{} {}", self.starting_id, self.entries.len())?;
             // Write entries
@@ -167,6 +223,13 @@ impl XrefSection {
 }
 
 pub use crate::parser_aux::{decode_xref_stream, decode_xref_stream_with_limit};
+
+pub(crate) fn null_serialization_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "null cross-reference authority must be normalized before serialization",
+    )
+}
 
 /// Encode a field value as big-endian bytes with specified width
 fn encode_field(value: u64, width: usize, output: &mut Vec<u8>) {
@@ -216,7 +279,12 @@ impl<'a> XrefStreamBuilder<'a> {
                     max_container = max_container.max(*container);
                     max_index = max_index.max(*index);
                 }
-                _ => {}
+                XrefEntry::Free { next_free, generation } => {
+                    max_offset = max_offset.max(*next_free as u64);
+                    max_gen = max_gen.max(*generation);
+                }
+                XrefEntry::UnusableFree => max_gen = u16::MAX,
+                XrefEntry::Null => {}
             }
         }
 
@@ -242,7 +310,7 @@ impl<'a> XrefStreamBuilder<'a> {
         self.entries.sort_by_key(|(id, _)| *id);
 
         for (_, entry) in &self.entries {
-            let encoded = entry.encode_for_xref_stream(&self.widths);
+            let encoded = entry.encode_for_xref_stream(&self.widths)?;
             content.extend_from_slice(&encoded);
         }
 
@@ -310,5 +378,34 @@ fn bytes_needed(value: u64) -> usize {
         1
     } else {
         (64 - value.leading_zeros()).div_ceil(8) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compressed_entry_cannot_be_serialized_for_a_classic_table() {
+        let mut buffer = Vec::new();
+        let error = XrefEntry::Compressed { container: 7, index: 2 }
+            .write_xref_entry(&mut buffer)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            buffer.is_empty(),
+            "no free-entry bytes may be produced for a compressed entry"
+        );
+    }
+
+    #[test]
+    fn section_writing_propagates_the_compressed_entry_rejection() {
+        let mut section = XrefSection::new(2);
+        section.add_entry(XrefEntry::Compressed { container: 7, index: 2 });
+
+        let mut buffer = Vec::new();
+        let error = section.write_xref_section(&mut buffer).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(buffer.is_empty());
     }
 }
