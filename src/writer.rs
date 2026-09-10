@@ -784,7 +784,7 @@ impl Writer {
                 let mut buf = itoa::Buffer::new();
                 file.write_all(buf.format(*value).as_bytes())
             }
-            Real(value) => write!(file, "{value}"),
+            Real(value) => Writer::write_real(file, *value),
             Name(name) => Writer::write_name(file, name),
             String(text, format) => Writer::write_string(file, text, format),
             Array(array) => Writer::write_array(file, array),
@@ -792,6 +792,36 @@ impl Writer {
             Object::Stream(stream) => Writer::write_stream(file, stream),
             Reference(id) => write!(file, "{} {} R", id.0, id.1),
         }
+    }
+
+    /// Write a `Real` as a PDF real-number token.
+    ///
+    /// The PDF number grammar has no exponent notation and a token without a
+    /// decimal point is an integer, so neither the shortest exponent form nor
+    /// the bare integral form of an `f32` is a valid real. The shortest
+    /// round-trip decimal digits are taken in scientific form and expanded to
+    /// plain decimal notation that always contains a decimal point. Every
+    /// finite `f32` therefore keeps both its object variant and its exact value
+    /// across a save/load cycle. Non-finite values have no PDF number
+    /// representation and are rejected instead of being emitted as `NaN` or
+    /// `inf`.
+    fn write_real(file: &mut dyn Write, value: f32) -> Result<()> {
+        let token = Writer::format_real(value).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot write a non-finite Real as a PDF number",
+            )
+        })?;
+        file.write_all(token.as_bytes())
+    }
+
+    /// The plain decimal PDF token for a finite `f32`, or `None` when the value
+    /// is non-finite.
+    fn format_real(value: f32) -> Option<std::string::String> {
+        if !value.is_finite() {
+            return None;
+        }
+        expand_scientific_real(&format!("{value:e}"))
     }
 
     fn write_name(file: &mut dyn Write, name: &[u8]) -> Result<()> {
@@ -914,6 +944,48 @@ impl Writer {
 
         Ok(())
     }
+}
+
+/// Expand a shortest-round-trip scientific `f32` representation, as produced
+/// by `format!("{value:e}")`, into plain decimal notation.
+///
+/// The input has the form `[-]D[.D]e[-]N`; the output is the same decimal
+/// value written without an exponent and always contains a decimal point, so
+/// it is a valid PDF real token. `None` is returned for input that does not
+/// have the expected shape; the caller turns that into a write error.
+fn expand_scientific_real(scientific: &str) -> Option<std::string::String> {
+    let (mantissa, exponent) = scientific.split_once('e')?;
+    let exponent: i32 = exponent.parse().ok()?;
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    let (digits, fractional) = match mantissa.split_once('.') {
+        Some((integer, fraction)) => (format!("{integer}{fraction}"), fraction.len()),
+        None => (mantissa.to_string(), 0),
+    };
+    // Position of the decimal point relative to the start of `digits`.
+    let point = i32::try_from(digits.len()).ok()? - i32::try_from(fractional).ok()? + exponent;
+
+    let mut token = std::string::String::with_capacity(sign.len() + digits.len() + 4);
+    token.push_str(sign);
+    if point <= 0 {
+        token.push_str("0.");
+        token.extend(std::iter::repeat_n('0', usize::try_from(-point).ok()?));
+        token.push_str(&digits);
+    } else {
+        let point = usize::try_from(point).ok()?;
+        if point < digits.len() {
+            token.push_str(&digits[..point]);
+            token.push('.');
+            token.push_str(&digits[point..]);
+        } else {
+            token.push_str(&digits);
+            token.extend(std::iter::repeat_n('0', point - digits.len()));
+            token.push_str(".0");
+        }
+    }
+    Some(token)
 }
 
 pub struct CountingWrite<W: Write> {
@@ -1405,4 +1477,131 @@ fn counting_write_all_underlying_error_does_not_advance_counter() {
     let error = file.write_all(b"abc").unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     assert_eq!(file.bytes_written, 10);
+}
+
+/// A deterministic grid across sign, exponent and mantissa patterns, plus
+/// exact boundary bit patterns. Not an exhaustive 2^32 sweep.
+#[cfg(test)]
+fn sampled_finite_real_bits() -> Vec<u32> {
+    let mut bits = Vec::new();
+    for sign in [0u32, 0x8000_0000] {
+        for exponent in [0u32, 1, 2, 3, 4, 7, 15, 30, 60, 100, 126, 127, 128, 150, 200, 254] {
+            for mantissa in [0u32, 1, 2, 0x40_0000, 0x7f_ffff, 0x12_3456] {
+                bits.push(sign | (exponent << 23) | mantissa);
+            }
+        }
+    }
+    bits.sort_unstable();
+    bits.dedup();
+    bits
+}
+
+#[cfg(test)]
+fn assert_real_token(value: f32) {
+    let mut buffer = Vec::new();
+    Writer::write_object(&mut buffer, &Real(value)).unwrap();
+    let token = std::str::from_utf8(&buffer).unwrap();
+    assert!(
+        token.contains('.'),
+        "{value:?} serialized as {token:?} without a decimal point"
+    );
+    assert!(
+        !token.contains('e') && !token.contains('E'),
+        "{value:?} serialized as {token:?} with an exponent"
+    );
+    let parsed: f32 = token
+        .parse()
+        .unwrap_or_else(|error| panic!("{token:?} is not an f32: {error}"));
+    assert_eq!(
+        parsed.to_bits(),
+        value.to_bits(),
+        "{value:?} serialized as {token:?} and parsed back as {parsed:?}"
+    );
+}
+
+#[test]
+fn required_real_values_keep_real_syntax_and_round_trip() {
+    for value in [0.0, -0.0, 1.0, -1.0, 2.0, 1.5, -1.5, 0.5, 0.1] {
+        assert_real_token(value);
+    }
+}
+
+#[test]
+fn integral_reals_are_not_written_as_integers() {
+    let mut buffer = Vec::new();
+    Writer::write_object(&mut buffer, &Real(1.0)).unwrap();
+    assert_eq!(buffer, b"1.0");
+    buffer.clear();
+    Writer::write_object(&mut buffer, &Real(-1.0)).unwrap();
+    assert_eq!(buffer, b"-1.0");
+    buffer.clear();
+    Writer::write_object(&mut buffer, &Real(0.0)).unwrap();
+    assert_eq!(buffer, b"0.0");
+}
+
+#[test]
+fn negative_zero_keeps_its_sign_and_bits() {
+    let mut buffer = Vec::new();
+    Writer::write_object(&mut buffer, &Real(-0.0)).unwrap();
+    assert_eq!(buffer, b"-0.0");
+    let parsed: f32 = std::str::from_utf8(&buffer).unwrap().parse().unwrap();
+    assert_eq!(parsed.to_bits(), (-0.0f32).to_bits());
+    assert_ne!(parsed.to_bits(), 0.0f32.to_bits());
+}
+
+#[test]
+fn exponent_prone_and_boundary_reals_round_trip() {
+    for value in [
+        f32::MIN_POSITIVE,
+        f32::EPSILON,
+        f32::MAX,
+        -f32::MAX,
+        f32::MIN,
+        1.0e-20,
+        1.0e-30,
+        1.0e20,
+        1.0e30,
+        1.0e38,
+        f32::from_bits(0x0000_0001),
+        f32::from_bits(0x8000_0001),
+        f32::from_bits(0x003f_ffff),
+        f32::from_bits(0x807f_ffff),
+    ] {
+        assert_real_token(value);
+    }
+}
+
+#[test]
+fn sampled_finite_real_bits_keep_real_syntax_and_round_trip() {
+    let bits = sampled_finite_real_bits();
+    assert!(bits.len() > 100, "the sample must span the sign/exponent/mantissa grid");
+    for bit_pattern in bits {
+        assert_real_token(f32::from_bits(bit_pattern));
+    }
+}
+
+#[test]
+fn nonfinite_reals_are_rejected_without_writing_a_token() {
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut buffer = Vec::new();
+        let error = Writer::write_object(&mut buffer, &Real(value)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(buffer.is_empty(), "{value:?} wrote {buffer:?} before failing");
+    }
+}
+
+#[test]
+fn nonfinite_reals_are_rejected_inside_containers() {
+    for object in [
+        Array(vec![Real(f32::NAN)]),
+        Object::Dictionary({
+            let mut dict = Dictionary::new();
+            dict.set("Value", Real(f32::INFINITY));
+            dict
+        }),
+    ] {
+        let mut buffer = Vec::new();
+        let error = Writer::write_object(&mut buffer, &object).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 }
