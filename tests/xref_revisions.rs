@@ -1109,11 +1109,7 @@ fn object_stream_index_controls_full_and_metadata_identity() {
                 .ok()
                 .and_then(|d| d.get(b"Title").ok())
                 .and_then(|o| o.as_str().ok());
-            assert_eq!(
-                actual,
-                title.map(str::as_bytes),
-                "password={password:?}, first={first_id}, index={index}"
-            );
+            assert_eq!(actual, title.map(str::as_bytes), "first={first_id}, index={index}");
             let metadata = Document::load_metadata_mem_with_password(&bytes, password.unwrap_or("")).unwrap();
             assert_eq!(metadata.title.as_deref(), title);
         }
